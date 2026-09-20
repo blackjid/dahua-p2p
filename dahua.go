@@ -5,6 +5,7 @@ package dahua
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -22,6 +23,13 @@ var ErrDialTimeout = tunnel.ErrDialTimeout
 // but is still serving its existing ones. Callers should acquire again to get
 // a fresh tunnel rather than treating it as a failure.
 var ErrTunnelRetired = tunnel.ErrTunnelRetired
+
+// ErrSessionManagerClosed is returned by Acquire after CloseAll has started.
+var ErrSessionManagerClosed = errors.New("dahua session manager closed")
+
+// ErrFixedPortCapacity is returned when a tunnel bound to a fixed UDP port is
+// full. A second tunnel cannot bind the same local port concurrently.
+var ErrFixedPortCapacity = errors.New("fixed P2P port tunnel is at capacity")
 
 // Settle times between consecutive RTSP negotiations on one tunnel. The
 // device needs a breather after a DESCRIBE before it will answer the next
@@ -223,6 +231,7 @@ type SessionManager struct {
 	sessions    map[sessionKey][]*managedSession
 	inflight    map[sessionKey]*inflightConn
 	IdleTimeout time.Duration
+	closed      bool
 }
 
 // sessionKey contains every setting that changes which underlying tunnel may
@@ -306,13 +315,18 @@ func (m *SessionManager) findAvailableSession(key sessionKey) *managedSession {
 }
 
 // Acquire returns a cached or new client for the given config.
-// If all existing tunnels are at capacity, a new tunnel is created.
+// If all existing tunnels are at capacity, a new tunnel is created unless the
+// config pins one local UDP port, which cannot be bound by two live tunnels.
 // The caller must call Release when done.
 func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 	key := sessionKeyFor(cfg)
 
 	for {
 		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return nil, ErrSessionManagerClosed
+		}
 		if s := m.findAvailableSession(key); s != nil {
 			if s.idleTimer != nil {
 				s.idleTimer.Stop()
@@ -321,6 +335,10 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 			s.refCount++
 			m.mu.Unlock()
 			return s.client, nil
+		}
+		if key.p2pPort != 0 && len(m.sessions[key]) != 0 {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %d", ErrFixedPortCapacity, key.p2pPort)
 		}
 
 		// Another goroutine is already handshaking for this configuration.
@@ -339,11 +357,14 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 		m.mu.Unlock()
 
 		client, err := ConnectWithConfig(cfg)
-		inf.err = err
 
 		var ms *managedSession
 		m.mu.Lock()
 		delete(m.inflight, key)
+		if err == nil && m.closed {
+			err = ErrSessionManagerClosed
+		}
+		inf.err = err
 		if err == nil {
 			ms = &managedSession{
 				client:    client,
@@ -355,6 +376,12 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 		m.mu.Unlock()
 		if err == nil {
 			client.SetOnClose(func() { m.forget(key, ms) })
+		} else if client != nil {
+			if closeErr := client.Close(); closeErr != nil {
+				if cfg.Error != nil {
+					cfg.Error("close unused tunnel: %s", closeErr)
+				}
+			}
 		}
 
 		close(inf.done)
@@ -452,9 +479,10 @@ func (m *SessionManager) Release(serial string, client *Client) {
 	}
 }
 
-// CloseAll closes all active sessions immediately.
+// CloseAll permanently closes the manager and all active sessions.
 func (m *SessionManager) CloseAll() {
 	m.mu.Lock()
+	m.closed = true
 	var all []*managedSession
 	for key, sessions := range m.sessions {
 		for _, s := range sessions {

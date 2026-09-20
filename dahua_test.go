@@ -1,6 +1,7 @@
 package dahua
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/blackjid/dahua-p2p/tunnel"
@@ -20,6 +21,30 @@ func TestFindAvailableSessionUsesReservations(t *testing.T) {
 	session.refCount--
 	if got := manager.findAvailableSession(key); got != session {
 		t.Fatal("session with a free reservation was not returned")
+	}
+}
+
+func TestClosedSessionManagerRejectsAcquire(t *testing.T) {
+	manager := NewSessionManager()
+	manager.CloseAll()
+
+	if _, err := manager.Acquire(Config{}); !errors.Is(err, ErrSessionManagerClosed) {
+		t.Fatalf("Acquire after CloseAll = %v, want ErrSessionManagerClosed", err)
+	}
+}
+
+func TestFixedPortAtCapacityDoesNotOpenSecondTunnel(t *testing.T) {
+	cfg := Config{Serial: "device", P2PPort: 5000, MaxRealms: 1}
+	key := sessionKeyFor(cfg)
+	manager := NewSessionManager()
+	manager.sessions[key] = []*managedSession{{
+		client:    &Client{tunnel: &tunnel.Tunnel{}},
+		refCount:  1,
+		maxRealms: 1,
+	}}
+
+	if _, err := manager.Acquire(cfg); !errors.Is(err, ErrFixedPortCapacity) {
+		t.Fatalf("Acquire at fixed-port capacity = %v, want ErrFixedPortCapacity", err)
 	}
 }
 

@@ -158,7 +158,7 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 			if deviceInfo.RTSPPort > 0 && deviceInfo.RTSPPort <= 65535 {
 				rtspPort = uint32(deviceInfo.RTSPPort)
 			}
-			opts.trace("device info randsalt=%s rtspport=%d", randsalt, deviceInfo.RTSPPort)
+			opts.trace("device info randsalt_present=%t rtspport=%d", randsalt != "", deviceInfo.RTSPPort)
 		}
 	}
 
@@ -255,7 +255,7 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 		return nil, err
 	}
 
-	opts.trace("agent info agent=%s token=%s", agentAddr, token)
+	opts.trace("agent info agent=%s", agentAddr)
 
 	// Step 6: Connect to agent and start relay
 	opts.trace("step 6: connecting to agent %s", agentAddr)
@@ -268,7 +268,7 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 		return nil, fmt.Errorf("failed to connect to agent: %w", err)
 	}
 
-	opts.trace("step 6: starting relay token=%s", token)
+	opts.trace("step 6: starting relay")
 	if err = p2pClient.Request(fmt.Sprintf("/relay/start/%s", token), "<body><Client>:0</Client></body>"); err != nil {
 		return nil, fmt.Errorf("failed to start relay: %w", err)
 	}
@@ -429,7 +429,7 @@ func Handshake(opts HandshakeOptions) (result *HandshakeResult, err error) {
 		return nil, err
 	}
 
-	opts.trace("got sign %x", sign)
+	opts.trace("got sign")
 
 	// Step 12: punch a hole directly to the device.
 	// mainClient and p2pClient have served their purpose (address discovery

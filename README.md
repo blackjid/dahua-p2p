@@ -23,6 +23,49 @@ The root package performs the handshake, shares tunnels, and exposes each
 device realm as a standard `net.Conn`. The `dh`, `ptcp`, and `tunnel`
 subpackages expose the lower protocol layers for diagnostics and research.
 
+## RTSP bridge
+
+The included `cmd/dahua-p2p` executable exposes a device's RTSP port locally
+for any standard RTSP client. It carries RTSP and interleaved RTP over the P2P
+tunnel. The consuming client must use TCP transport; UDP media cannot cross
+this TCP bridge.
+
+```sh
+docker network create cameras
+docker run --rm --name dahua-p2p --network cameras -p 8554:8554 \
+  -e DAHUA_SERIAL=YOUR_SERIAL \
+  -e DAHUA_USERNAME=admin \
+  -e DAHUA_PASSWORD=secret \
+  ghcr.io/blackjid/dahua-p2p:latest
+```
+
+For example, an unmodified upstream go2rtc can consume the bridge as an
+ordinary RTSP source:
+
+```yaml
+streams:
+  camera:
+    - rtsp://admin:secret@dahua-p2p:8554/cam/realmonitor?channel=1&subtype=0#transport=tcp
+```
+
+Run one bridge per Dahua device or NVR. Different channels and subtypes can
+share that bridge and its P2P tunnel.
+
+| Environment | Flag | Default | Purpose |
+|---|---|---:|---|
+| `DAHUA_SERIAL` | `-serial` | required | Device serial registered with easy4ip |
+| `DAHUA_USERNAME` | `-username` | empty | Device username |
+| `DAHUA_PASSWORD` | — | empty | Device password |
+| `DAHUA_PASSWORD_FILE` | — | empty | File containing the device password |
+| `LISTEN_ADDR` | `-listen` | `:8554` | RTSP TCP listen address |
+| `DAHUA_P2P_PORT` | `-p2p-port` | `0` | Fixed local UDP port; `0` chooses one |
+| `DAHUA_MAX_REALMS` | `-max-realms` | `8` | Connections per shared P2P tunnel |
+| `DAHUA_MAX_CONNECTIONS` | `-max-connections` | `32` | Total concurrent RTSP clients |
+
+Use `-debug` to print protocol traces.
+When `DAHUA_P2P_PORT` is fixed, `DAHUA_MAX_CONNECTIONS` cannot exceed
+`DAHUA_MAX_REALMS` because two tunnels cannot bind the same UDP port.
+
 ## Handshake
 
 Four parties: this client, Dahua's main server, a relay agent, and the device.
