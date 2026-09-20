@@ -59,12 +59,6 @@ func run() error {
 		return err
 	}
 
-	listener, err := net.Listen("tcp", cfg.listen)
-	if err != nil {
-		return err
-	}
-	defer closeListener(listener)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -74,6 +68,17 @@ func run() error {
 		slots:       make(chan struct{}, cfg.maxConns),
 		connections: make(map[net.Conn]struct{}),
 	}
+
+	if err = b.prewarm(); err != nil {
+		return fmt.Errorf("prewarm P2P tunnel: %w", err)
+	}
+
+	listener, err := net.Listen("tcp", cfg.listen)
+	if err != nil {
+		b.sessions.CloseAll()
+		return err
+	}
+	defer closeListener(listener)
 
 	log.Printf("Dahua P2P bridge listening on %s for serial %s", listener.Addr(), cfg.serial)
 	return b.serve(ctx, listener)
@@ -200,6 +205,33 @@ func (b *bridge) serve(ctx context.Context, listener net.Listener) error {
 	}
 }
 
+// prewarm establishes one tunnel at startup and intentionally retains its
+// reservation. CloseAll releases it when the bridge shuts down. The extra
+// internal realm keeps maxRealms available for actual RTSP connections.
+func (b *bridge) prewarm() error {
+	if _, err := b.sessions.Acquire(b.clientConfig()); err != nil {
+		return err
+	}
+	log.Printf("Dahua P2P tunnel ready for serial %s", b.config.serial)
+	return nil
+}
+
+func (b *bridge) clientConfig() dahua.Config {
+	cfg := dahua.Config{
+		Serial:    b.config.serial,
+		Username:  b.config.username,
+		Password:  b.config.password,
+		Timeout:   b.config.timeout,
+		P2PPort:   b.config.p2pPort,
+		MaxRealms: b.config.maxRealms + 1,
+		Error:     func(format string, args ...any) { log.Printf("dahua: "+format, args...) },
+	}
+	if b.config.debug {
+		cfg.Trace = func(format string, args ...any) { log.Printf("dahua: "+format, args...) }
+	}
+	return cfg
+}
+
 func (b *bridge) track(conn net.Conn) {
 	b.mu.Lock()
 	b.connections[conn] = struct{}{}
@@ -249,20 +281,7 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 		return
 	}
 
-	cfg := dahua.Config{
-		Serial:    b.config.serial,
-		Username:  b.config.username,
-		Password:  b.config.password,
-		Timeout:   b.config.timeout,
-		P2PPort:   b.config.p2pPort,
-		MaxRealms: b.config.maxRealms,
-		Error:     func(format string, args ...any) { log.Printf("dahua: "+format, args...) },
-	}
-	if b.config.debug {
-		cfg.Trace = func(format string, args ...any) { log.Printf("dahua: "+format, args...) }
-	}
-
-	device, finishNegotiation, release, err := b.openRealm(ctx, cfg)
+	device, finishNegotiation, release, err := b.openRealm(ctx, b.clientConfig())
 	if err != nil {
 		log.Printf("open P2P realm from %s: %v", upstream.RemoteAddr(), err)
 		return

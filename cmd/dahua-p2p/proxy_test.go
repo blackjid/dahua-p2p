@@ -188,3 +188,22 @@ func TestValidRTSPRequest(t *testing.T) {
 		}
 	}
 }
+
+func TestClientConfigReservesPrewarmSlot(t *testing.T) {
+	b := &bridge{config: config{
+		serial:    "device",
+		username:  "user",
+		password:  "pass",
+		p2pPort:   5000,
+		maxRealms: 8,
+		timeout:   10 * time.Second,
+	}}
+
+	cfg := b.clientConfig()
+	if cfg.MaxRealms != 9 {
+		t.Fatalf("MaxRealms = %d, want 9", cfg.MaxRealms)
+	}
+	if cfg.Serial != b.config.serial || cfg.Username != b.config.username || cfg.Password != b.config.password {
+		t.Fatal("clientConfig did not preserve device credentials")
+	}
+}

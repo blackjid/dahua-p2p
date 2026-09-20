@@ -49,7 +49,10 @@ streams:
 ```
 
 Run one bridge per Dahua device or NVR. Different channels and subtypes can
-share that bridge and its P2P tunnel.
+share that bridge and its P2P tunnel. The bridge establishes and pins the P2P
+tunnel before it opens the RTSP listener, so the first RTSP client does not pay
+the cloud handshake cost. If the initial handshake fails, the process exits so
+the container runtime can restart it.
 
 | Environment | Flag | Default | Purpose |
 |---|---|---:|---|
