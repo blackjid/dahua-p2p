@@ -49,10 +49,11 @@ streams:
 ```
 
 Run one bridge per Dahua device or NVR. Different channels and subtypes can
-share that bridge and its P2P tunnel. The bridge establishes and pins the P2P
+share that bridge and its P2P tunnel. The bridge establishes and owns one P2P
 tunnel before it opens the RTSP listener, so the first RTSP client does not pay
 the cloud handshake cost. If the initial handshake fails, the process exits so
-the container runtime can restart it.
+the container runtime can restart it. If that tunnel later dies or retires, the
+bridge also exits instead of starting a competing tunnel for the same device.
 
 | Environment | Flag | Default | Purpose |
 |---|---|---:|---|
@@ -66,8 +67,8 @@ the container runtime can restart it.
 | `DAHUA_MAX_CONNECTIONS` | `-max-connections` | `32` | Total concurrent RTSP clients |
 
 Use `-debug` to print protocol traces.
-When `DAHUA_P2P_PORT` is fixed, `DAHUA_MAX_CONNECTIONS` cannot exceed
-`DAHUA_MAX_REALMS` because two tunnels cannot bind the same UDP port.
+The bridge owns one tunnel, so its effective connection limit is the lower of
+`DAHUA_MAX_CONNECTIONS` and `DAHUA_MAX_REALMS`.
 
 ## Handshake
 

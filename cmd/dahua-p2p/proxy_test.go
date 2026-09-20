@@ -189,7 +189,7 @@ func TestValidRTSPRequest(t *testing.T) {
 	}
 }
 
-func TestClientConfigReservesPrewarmSlot(t *testing.T) {
+func TestClientConfig(t *testing.T) {
 	b := &bridge{config: config{
 		serial:    "device",
 		username:  "user",
@@ -200,10 +200,28 @@ func TestClientConfigReservesPrewarmSlot(t *testing.T) {
 	}}
 
 	cfg := b.clientConfig()
-	if cfg.MaxRealms != 9 {
-		t.Fatalf("MaxRealms = %d, want 9", cfg.MaxRealms)
+	if cfg.MaxRealms != 8 {
+		t.Fatalf("MaxRealms = %d, want 8", cfg.MaxRealms)
 	}
 	if cfg.Serial != b.config.serial || cfg.Username != b.config.username || cfg.Password != b.config.password {
 		t.Fatal("clientConfig did not preserve device credentials")
+	}
+}
+
+func TestConnectionLimit(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config
+		want int
+	}{
+		{name: "realm limit", cfg: config{maxConns: 32, maxRealms: 8}, want: 8},
+		{name: "connection limit", cfg: config{maxConns: 4, maxRealms: 8}, want: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := connectionLimit(tt.cfg); got != tt.want {
+				t.Fatalf("connectionLimit() = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }

@@ -40,7 +40,8 @@ type config struct {
 
 type bridge struct {
 	config      config
-	sessions    *dahua.SessionManager
+	client      *dahua.Client
+	cancel      context.CancelFunc
 	slots       chan struct{}
 	connections map[net.Conn]struct{}
 	mu          sync.Mutex
@@ -61,27 +62,37 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	b := &bridge{
 		config:      cfg,
-		sessions:    dahua.NewSessionManager(),
-		slots:       make(chan struct{}, cfg.maxConns),
+		cancel:      cancel,
+		slots:       make(chan struct{}, connectionLimit(cfg)),
 		connections: make(map[net.Conn]struct{}),
 	}
 
-	if err = b.prewarm(); err != nil {
-		return fmt.Errorf("prewarm P2P tunnel: %w", err)
+	if err = b.connect(); err != nil {
+		return fmt.Errorf("connect P2P tunnel: %w", err)
 	}
+	b.client.SetOnClose(cancel)
 
 	listener, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
-		b.sessions.CloseAll()
+		_ = b.client.Close()
 		return err
 	}
 	defer closeListener(listener)
 
 	log.Printf("Dahua P2P bridge listening on %s for serial %s", listener.Addr(), cfg.serial)
 	return b.serve(ctx, listener)
+}
+
+func connectionLimit(cfg config) int {
+	if cfg.maxConns < cfg.maxRealms {
+		return cfg.maxConns
+	}
+	return cfg.maxRealms
 }
 
 func loadConfig() (config, error) {
@@ -128,8 +139,6 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("max realms must be positive: %d", cfg.maxRealms)
 	case cfg.maxConns < 1:
 		return config{}, fmt.Errorf("max connections must be positive: %d", cfg.maxConns)
-	case cfg.p2pPort != 0 && cfg.maxConns > cfg.maxRealms:
-		return config{}, errors.New("max connections cannot exceed max realms with a fixed P2P port")
 	case cfg.timeout <= 0:
 		return config{}, fmt.Errorf("timeout must be positive: %s", cfg.timeout)
 	}
@@ -205,13 +214,15 @@ func (b *bridge) serve(ctx context.Context, listener net.Listener) error {
 	}
 }
 
-// prewarm establishes one tunnel at startup and intentionally retains its
-// reservation. CloseAll releases it when the bridge shuts down. The extra
-// internal realm keeps maxRealms available for actual RTSP connections.
-func (b *bridge) prewarm() error {
-	if _, err := b.sessions.Acquire(b.clientConfig()); err != nil {
+// connect establishes the bridge's single persistent tunnel before the RTSP
+// listener opens. A closed or retired tunnel ends the process so the container
+// runtime can establish a clean replacement.
+func (b *bridge) connect() error {
+	client, err := dahua.ConnectWithConfig(b.clientConfig())
+	if err != nil {
 		return err
 	}
+	b.client = client
 	log.Printf("Dahua P2P tunnel ready for serial %s", b.config.serial)
 	return nil
 }
@@ -223,7 +234,7 @@ func (b *bridge) clientConfig() dahua.Config {
 		Password:  b.config.password,
 		Timeout:   b.config.timeout,
 		P2PPort:   b.config.p2pPort,
-		MaxRealms: b.config.maxRealms + 1,
+		MaxRealms: b.config.maxRealms,
 		Error:     func(format string, args ...any) { log.Printf("dahua: "+format, args...) },
 	}
 	if b.config.debug {
@@ -245,7 +256,9 @@ func (b *bridge) untrack(conn net.Conn) {
 }
 
 func (b *bridge) shutdown() {
-	b.sessions.CloseAll()
+	if b.client != nil {
+		_ = b.client.Close()
+	}
 	b.mu.Lock()
 	connections := make([]net.Conn, 0, len(b.connections))
 	for conn := range b.connections {
@@ -281,12 +294,14 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 		return
 	}
 
-	device, finishNegotiation, release, err := b.openRealm(ctx, b.clientConfig())
+	device, finishNegotiation, err := b.openRealm(ctx)
 	if err != nil {
 		log.Printf("open P2P realm from %s: %v", upstream.RemoteAddr(), err)
+		if b.client.IsClosed() || b.client.IsRetired() {
+			b.cancel()
+		}
 		return
 	}
-	defer release()
 	defer finishNegotiation()
 	defer closeConn(device)
 
@@ -314,44 +329,28 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 	}
 }
 
-func (b *bridge) openRealm(ctx context.Context, cfg dahua.Config) (net.Conn, func(), func(), error) {
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		client, err := b.sessions.Acquire(cfg)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("P2P handshake: %w", err)
-		}
-
-		negotiateCtx, cancel := context.WithTimeout(ctx, negotiateTimeout)
-		err = client.LockNegotiate(negotiateCtx)
-		cancel()
-		if err != nil {
-			b.sessions.Release(b.config.serial, client)
-			return nil, nil, nil, fmt.Errorf("negotiate lock: %w", err)
-		}
-		client.WaitSettle()
-
-		var finishOnce sync.Once
-		finish := func() {
-			finishOnce.Do(func() {
-				client.DoneNegotiate()
-				client.UnlockNegotiate()
-			})
-		}
-		device, err := client.Dial(client.RTSPPort())
-		if err == nil {
-			release := func() { b.sessions.Release(b.config.serial, client) }
-			return device, finish, release, nil
-		}
-
-		finish()
-		b.sessions.Release(b.config.serial, client)
-		lastErr = err
-		if cfg.P2PPort != 0 || !client.IsRetired() {
-			break
-		}
+func (b *bridge) openRealm(ctx context.Context) (net.Conn, func(), error) {
+	negotiateCtx, cancel := context.WithTimeout(ctx, negotiateTimeout)
+	err := b.client.LockNegotiate(negotiateCtx)
+	cancel()
+	if err != nil {
+		return nil, nil, fmt.Errorf("negotiate lock: %w", err)
 	}
-	return nil, nil, nil, fmt.Errorf("dial P2P realm: %w", lastErr)
+	b.client.WaitSettle()
+
+	var finishOnce sync.Once
+	finish := func() {
+		finishOnce.Do(func() {
+			b.client.DoneNegotiate()
+			b.client.UnlockNegotiate()
+		})
+	}
+	device, err := b.client.Dial(b.client.RTSPPort())
+	if err != nil {
+		finish()
+		return nil, nil, fmt.Errorf("dial P2P realm: %w", err)
+	}
+	return device, finish, nil
 }
 
 func closeListener(listener net.Listener) {
