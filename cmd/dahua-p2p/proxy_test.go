@@ -20,7 +20,7 @@ func TestSuperviseRestartsBridgeCycle(t *testing.T) {
 	calls := 0
 	wantErr := errors.New("tunnel failed")
 
-	err := supervise(ctx, 0, 0, func(context.Context) error {
+	err := supervise(ctx, backoff{}, func(context.Context) error {
 		calls++
 		if calls == 2 {
 			cancel()
@@ -312,5 +312,47 @@ func TestRefusalReasonNamesSentinels(t *testing.T) {
 	// An unclassified failure still has to say what went wrong.
 	if got := refusalReason(errors.New("boom")); !strings.Contains(got, "boom") {
 		t.Errorf("refusalReason of an unknown error = %q, want it to carry the message", got)
+	}
+}
+
+// A tunnel that died without reaching the device leaves the device holding the
+// session and its realms, because the teardown never arrived. Rebuilding
+// straight away stacks a second session on the first, which is how the device
+// ends up refusing every BIND while we believe we hold no realms.
+func TestBackoffWaitsOutTheDeviceAfterLosingContact(t *testing.T) {
+	b := backoff{min: time.Second, max: time.Hour, lostContact: 30 * time.Second}
+
+	// However short the current delay, losing contact jumps to the floor.
+	if got := b.next(b.min, errLostContact); got != b.lostContact {
+		t.Fatalf("next(%s, lost contact) = %s, want %s", b.min, got, b.lostContact)
+	}
+	// Wrapped the way runBridge returns it.
+	wrapped := fmt.Errorf("bridge cycle: %w", errLostContact)
+	if got := b.next(b.min, wrapped); got != b.lostContact {
+		t.Fatalf("next(%s, wrapped lost contact) = %s, want %s", b.min, got, b.lostContact)
+	}
+	// Losing contact repeatedly keeps backing off rather than sticking.
+	if got := b.next(b.lostContact, errLostContact); got <= b.lostContact {
+		t.Fatalf("next(%s, lost contact) = %s, want more than %s", b.lostContact, got, b.lostContact)
+	}
+
+	// A healthy session that simply ended still retries promptly: waiting
+	// there would cost a reconnecting dashboard its streams for no reason.
+	if got := b.next(b.lostContact, nil); got != b.min {
+		t.Fatalf("next(%s, nil) = %s, want %s", b.lostContact, got, b.min)
+	}
+
+	// An ordinary failure backs off, but is not held to the lost-contact floor.
+	if got := b.next(b.min, errors.New("handshake failed")); got != 2*time.Second {
+		t.Fatalf("next(%s, failure) = %s, want 2s", b.min, got)
+	}
+}
+
+func TestLostContactFloorExceedsTheOrdinaryDelay(t *testing.T) {
+	// A collapsed tunnel must not be rebuilt on the prompt-retry path, or it
+	// races the session the device has not expired yet.
+	if lostContactDelay <= reconnectMinDelay {
+		t.Fatalf("lostContactDelay %s must exceed reconnectMinDelay %s",
+			lostContactDelay, reconnectMinDelay)
 	}
 }

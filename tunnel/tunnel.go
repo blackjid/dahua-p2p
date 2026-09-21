@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/blackjid/dahua-p2p/dh"
@@ -79,6 +80,11 @@ type Tunnel struct {
 	bindTimeout time.Duration
 
 	lossReportInterval time.Duration
+
+	// lostContact records that the tunnel closed because the device stopped
+	// reaching us, which means our own DISCs did not reach it either. The
+	// device therefore still holds this session and every realm on it.
+	lostContact atomic.Bool
 
 	// Heartbeat
 	heartbeatTicker *time.Ticker
@@ -391,6 +397,19 @@ func (t *Tunnel) interruptWrite(writer *Conn) {
 	t.writeDeadlineMu.Unlock()
 }
 
+// LoseContact closes the tunnel and records that the device was unreachable
+// when it happened, so callers know the teardown was never delivered.
+func (t *Tunnel) LoseContact() {
+	t.lostContact.Store(true)
+	t.Close()
+}
+
+// LostContact reports whether the tunnel closed because the device stopped
+// reaching us. When it did, the DISCs Close sends went nowhere, so the device
+// keeps the session and its realms until its own timeout expires them, and a
+// replacement built immediately competes with the corpse of its predecessor.
+func (t *Tunnel) LostContact() bool { return t.lostContact.Load() }
+
 // Close closes the tunnel, sending DISC for all active realms first.
 func (t *Tunnel) Close() error {
 	t.mu.Lock()
@@ -544,7 +563,7 @@ func (t *Tunnel) sendHeartbeat() {
 
 	if missed > maxMissedHeartbeats {
 		t.errorf("too many missed heartbeats (%d), closing tunnel", missed)
-		t.Close()
+		t.LoseContact()
 		return
 	}
 
@@ -563,7 +582,7 @@ func (t *Tunnel) sendHeartbeat() {
 			"sent=%d peer_recv=%d out_msgs=%d recv=%d peer_sent=%d in_skew=%d realms=%d",
 			st.OutBytes(), outboundStallTimeout,
 			st.Sent, st.PeerRecv, st.OutMsgs(), st.Recv, st.PeerSent, st.InBytes(), t.ActiveRealms())
-		t.Close()
+		t.LoseContact()
 	}
 }
 
@@ -614,7 +633,7 @@ func (t *Tunnel) reader() {
 			t.consecutiveReadErrs++
 			if t.consecutiveReadErrs >= maxConsecutiveReadErrors {
 				t.errorf("too many read errors (%d), closing tunnel", t.consecutiveReadErrs)
-				t.Close()
+				t.LoseContact()
 				return
 			}
 			continue
@@ -748,7 +767,7 @@ func (t *Tunnel) flushACK() {
 	}
 	if errs >= maxConsecutiveSendErrors {
 		t.errorf("too many ACK send errors (%d), closing tunnel", errs)
-		t.Close()
+		t.LoseContact()
 		return
 	}
 	t.trace("ACK send failed: %s", err)

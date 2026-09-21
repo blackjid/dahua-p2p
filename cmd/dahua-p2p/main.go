@@ -38,8 +38,16 @@ const (
 	// logInterval is the minimum gap between repeats of a throttled line.
 	logInterval = 5 * time.Second
 
-	reconnectMinDelay     = time.Second
-	reconnectMaxDelay     = 30 * time.Second
+	reconnectMinDelay = time.Second
+	reconnectMaxDelay = 30 * time.Second
+
+	// lostContactDelay is how long to leave the device alone after a tunnel
+	// died without reaching it. Our DISCs went nowhere, so the device still
+	// holds that session and every realm on it, and a tunnel built straight
+	// away competes with the corpse of its predecessor until the device runs
+	// out of realms and refuses every BIND. Measured: about thirty seconds of
+	// quiet is enough for the device to expire a stranded session.
+	lostContactDelay      = 30 * time.Second
 	defaultMaxConnections = 32
 )
 
@@ -141,7 +149,11 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return supervise(ctx, reconnectMinDelay, reconnectMaxDelay, func(ctx context.Context) error {
+	return supervise(ctx, backoff{
+		min:         reconnectMinDelay,
+		max:         reconnectMaxDelay,
+		lostContact: lostContactDelay,
+	}, func(ctx context.Context) error {
 		return runBridge(ctx, cfg)
 	})
 }
@@ -173,6 +185,11 @@ func runBridge(ctx context.Context, cfg config) error {
 	if err := b.serve(ctx, listener); err != nil {
 		return err
 	}
+	// A tunnel the device stopped answering is the case that must not be
+	// rebuilt immediately, however well it was working beforehand.
+	if b.client.LostContact() {
+		return errLostContact
+	}
 	// A tunnel that never granted a realm is a failed attempt, not a healthy
 	// session that ended. Saying so lets the supervisor back off instead of
 	// rebuilding a tunnel the device is refusing once a second.
@@ -182,19 +199,23 @@ func runBridge(ctx context.Context, cfg config) error {
 	return nil
 }
 
-func supervise(ctx context.Context, minDelay, maxDelay time.Duration, runCycle func(context.Context) error) error {
-	delay := minDelay
+// backoff is how long to wait between bridge cycles. lostContact is the floor
+// applied when a tunnel died without reaching the device, which needs longer
+// than an ordinary failure because the device is still holding the session.
+type backoff struct {
+	min         time.Duration
+	max         time.Duration
+	lostContact time.Duration
+}
+
+func supervise(ctx context.Context, b backoff, runCycle func(context.Context) error) error {
+	delay := b.min
 	for {
 		err := runCycle(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
-		if err != nil {
-			log.Printf("Dahua P2P bridge stopped: %v", err)
-		} else {
-			log.Printf("Dahua P2P tunnel closed")
-			delay = minDelay
-		}
+		delay = b.next(delay, err)
 		log.Printf("reconnecting in %s", delay)
 
 		timer := time.NewTimer(delay)
@@ -206,9 +227,27 @@ func supervise(ctx context.Context, minDelay, maxDelay time.Duration, runCycle f
 			return nil
 		case <-timer.C:
 		}
-		if err != nil {
-			delay = nextBackoff(delay, maxDelay)
+	}
+}
+
+// next reports how long to wait after a cycle ended with err, and logs why.
+// A cycle that reached the device and ended cleanly may retry at once; one
+// that failed backs off; one that lost contact waits out the session the
+// device is still holding, however healthy the tunnel was beforehand.
+func (b backoff) next(delay time.Duration, err error) time.Duration {
+	switch {
+	case errors.Is(err, errLostContact):
+		log.Printf("Dahua P2P tunnel lost contact with the device")
+		if delay < b.lostContact {
+			return b.lostContact
 		}
+		return nextBackoff(delay, b.max)
+	case err != nil:
+		log.Printf("Dahua P2P bridge stopped: %v", err)
+		return nextBackoff(delay, b.max)
+	default:
+		log.Printf("Dahua P2P tunnel closed")
+		return b.min
 	}
 }
 
@@ -499,6 +538,10 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 
 // Reasons a stream is turned away, kept as sentinels so the log groups them
 // rather than printing one line per retry.
+// errLostContact marks a cycle that ended because the device stopped reaching
+// us, which is also why it never received our teardown.
+var errLostContact = errors.New("device unreachable")
+
 var (
 	errAdmitTimeout  = errors.New("waiting for negotiate lock")
 	errRealmCapacity = errors.New("realm capacity reached")

@@ -194,6 +194,11 @@ func (c *Client) IsResponsive(d time.Duration) bool {
 // streams it is already carrying.
 func (c *Client) Retire() { c.tunnel.Retire() }
 
+// LostContact reports whether the tunnel closed because the device stopped
+// reaching us. Callers should wait before rebuilding: our teardown never
+// arrived, so the device still holds this session and all of its realms.
+func (c *Client) LostContact() bool { return c.tunnel.LostContact() }
+
 // IsRetired reports whether the client has stopped accepting new realms.
 func (c *Client) IsRetired() bool { return c.tunnel.IsRetired() }
 
@@ -226,7 +231,7 @@ func (c *Client) Dial(port uint32) (net.Conn, error) {
 	switch {
 	case !c.tunnel.IsResponsive(deadTunnelSilence):
 		c.reportError("device silent, closing tunnel")
-		_ = c.Close()
+		c.tunnel.LoseContact()
 	case c.tunnel.BindFailures() >= maxBindFailures:
 		c.reportError("tunnel not granting realms, retiring (bind_failures=%d realms=%d)",
 			c.tunnel.BindFailures(), c.tunnel.ActiveRealms())
