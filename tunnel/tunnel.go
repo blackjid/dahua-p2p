@@ -210,8 +210,8 @@ func (t *Tunnel) reportLoss() {
 			t.missedHeartbeatsMu.Lock()
 			missed := t.missedHeartbeats
 			t.missedHeartbeatsMu.Unlock()
-			t.trace("ptcp counters sent=%d peer_recv=%d out_unacked=%d out_msgs=%d recv=%d peer_sent=%d in_skew=%d missed_hb=%d realms=%d",
-				st.Sent, st.PeerRecv, st.OutBytes(), st.OutMsgs(),
+			t.trace("ptcp counters sent=%d peer_recv=%d out_unacked=%d out_lag_ms=%d recv=%d peer_sent=%d in_skew=%d missed_hb=%d realms=%d",
+				st.Sent, st.PeerRecv, st.OutBytes(), st.OutLagMillis(),
 				st.Recv, st.PeerSent, st.InBytes(), missed, t.ActiveRealms())
 		}
 	}

@@ -2,7 +2,9 @@ package ptcp
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
+	"time"
 )
 
 func TestHeaderRoundTrip(t *testing.T) {
@@ -144,29 +146,127 @@ func TestPacketRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSessionPIDUniqueness(t *testing.T) {
-	// Regression for commit e35d592: every non-SYNC packet must get a unique
-	// PID, or the device deduplicates and drops our ACKs.
-	s := NewSession()
-	seen := map[uint32]bool{}
-	for i := 0; i < 10; i++ {
-		p := s.Send(NewEmptyBody())
-		if seen[p.Header.PID] {
-			t.Fatalf("duplicate PID %#x on packet %d", p.Header.PID, i)
+// Bodies lifted byte-for-byte from a DMSS capture. The STAT length field is
+// the subtle one: it stays zero even though CONN/DISC follows it, so the
+// trailer is found by position.
+func TestBodyWireShapeMatchesCapture(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body *Body
+		want string
+	}{
+		{"disc", NewStatusBody(0xffd2c46c, StatusDisconnect), "12000000ffd2c46c0000000044495343"},
+		{"conn", NewStatusBody(0x5f7f1ce8, StatusConnect), "120000005f7f1ce800000000434f4e4e"},
+		{"bind", NewBindBody(0xfffffe91, 37777), "11000008fffffe9100000000000093917f000001"},
+		{"heartbeat", NewHeartbeatBody(), "130000000000000000000000"},
+		{"sync", NewSyncBody(), "00030100"},
+	} {
+		if got := hex.EncodeToString(tc.body.Serialize()); got != tc.want {
+			t.Errorf("%s:\n got %s\nwant %s", tc.name, got, tc.want)
 		}
-		seen[p.Header.PID] = true
 	}
 }
 
-func TestSessionLMIDMonotonic(t *testing.T) {
+// PID is not a packet identifier. In a DMSS capture three BINDs for three
+// different realms went out ten milliseconds apart all carrying pid=63345 and
+// the device granted every one, and the device itself used 83 distinct values
+// across 4776 packets. What it carries is 0xFFFF minus the bytes taken in
+// since the previous transmission.
+func TestSessionPIDReportsBytesTakenSinceLastSend(t *testing.T) {
 	s := NewSession()
-	prev := uint32(0)
-	for i := 0; i < 5; i++ {
-		p := s.Send(NewHeartbeatBody())
-		if i > 0 && p.Header.LMID <= prev {
-			t.Fatalf("LMID not monotonic: packet %d has LMID %d, prev %d", i, p.Header.LMID, prev)
+
+	if got := s.Send(NewEmptyBody()).Header.PID; got != 0xFFFF {
+		t.Fatalf("PID with nothing received = %#x, want 0xFFFF", got)
+	}
+
+	// A heartbeat body counts 12 towards the receive counter.
+	s.Recv(NewPacket(&Header{}, NewHeartbeatBody()))
+	if got := s.Send(NewEmptyBody()).Header.PID; got != 0xFFFF-12 {
+		t.Fatalf("PID after 12 bytes in = %#x, want %#x", got, 0xFFFF-12)
+	}
+
+	// Nothing new since, so the field reports zero rather than carrying on
+	// down: it describes the gap, not how many packets we have sent.
+	if got := s.Send(NewEmptyBody()).Header.PID; got != 0xFFFF {
+		t.Fatalf("PID with nothing new received = %#x, want 0xFFFF", got)
+	}
+}
+
+// The old scheme decremented a packet counter, which left the narrow band the
+// device ever emits (never more than ~4000 below 0xFFFF) after a few thousand
+// packets and wrapped every 65536. Sending forever must not do either.
+func TestSessionPIDStaysInBand(t *testing.T) {
+	s := NewSession()
+	for i := 0; i < 70000; i++ {
+		s.Recv(NewPacket(&Header{}, NewHeartbeatBody()))
+		pkt := s.Send(NewHeartbeatBody())
+		if pkt.Header.PID > 0x0000FFFF {
+			t.Fatalf("packet %d: PID %#08x exceeds 16 bits", i, pkt.Header.PID)
 		}
-		prev = p.Header.LMID
+		if pkt.Header.PID != 0xFFFF-12 {
+			t.Fatalf("packet %d: PID %#x drifted, want a steady %#x", i, pkt.Header.PID, 0xFFFF-12)
+		}
+	}
+}
+
+// LMID is a millisecond clock, not a sequence number: measured over a DMSS
+// capture it advances at 1.000 units per millisecond in both directions, and
+// 1573 of 2610 consecutive packets repeat the previous value. Packets sent
+// inside one tick must therefore share an LMID rather than each taking a new
+// one.
+func TestSessionLMIDIsAClock(t *testing.T) {
+	start := time.Now()
+	s := newSessionAt(start)
+
+	first := s.Send(NewHeartbeatBody()).Header.LMID
+	for i := 0; i < 20; i++ {
+		if got := s.Send(NewHeartbeatBody()).Header.LMID; got != first {
+			t.Fatalf("packet %d in the same tick has LMID %d, want %d", i, got, first)
+		}
+	}
+	if first == 0 {
+		t.Fatal("LMID started at 0, the value RMID uses for 'nothing received yet'")
+	}
+	if first%lmidTick != 0 {
+		t.Fatalf("LMID %d is not a multiple of the %d tick", first, lmidTick)
+	}
+
+	time.Sleep(3 * lmidTick * time.Millisecond)
+	later := s.Send(NewHeartbeatBody()).Header.LMID
+	elapsed := uint32(time.Since(start) / time.Millisecond)
+	if later <= first {
+		t.Fatalf("LMID %d did not advance past %d after sleeping", later, first)
+	}
+	if drift := int64(later-first) - int64(elapsed); drift > lmidTick || drift < -2*lmidTick {
+		t.Fatalf("LMID advanced %d over %dms elapsed, want it to track the clock",
+			later-first, elapsed)
+	}
+}
+
+// The clock has to stay an uptime. Seeding it from the wall clock put the
+// field above 2^31, where a peer storing it signed reads it as negative; the
+// app in the capture carried 24 million and the device 143 million, and a
+// bridge running for a year stays well under both.
+func TestSessionLMIDStaysInTheRangeBothEndpointsUse(t *testing.T) {
+	for _, uptime := range []time.Duration{
+		time.Minute, 7 * 24 * time.Hour, 60 * 24 * time.Hour, 500 * 24 * time.Hour,
+	} {
+		s := newSessionAt(time.Now().Add(-uptime))
+		got := s.Send(NewHeartbeatBody()).Header.LMID
+
+		if got == 0 {
+			t.Errorf("uptime %s: LMID is 0, the value RMID uses for 'nothing received yet'", uptime)
+		}
+		if got >= 1<<31 {
+			t.Errorf("uptime %s: LMID %d is above 2^31 and reads as %d to a peer storing it signed",
+				uptime, got, int32(got))
+		}
+	}
+
+	// Inside the wrap it is still a clock, not a constant.
+	s := newSessionAt(time.Now().Add(-time.Hour))
+	if got, want := s.Send(NewHeartbeatBody()).Header.LMID, uint32(time.Hour.Milliseconds()); got < want {
+		t.Fatalf("LMID %d after an hour of uptime, want at least %d: not tracking uptime", got, want)
 	}
 }
 
@@ -175,20 +275,6 @@ func TestSessionSyncHasFixedPID(t *testing.T) {
 	p := s.Send(NewSyncBody())
 	if p.Header.PID != 0x0002FFFF {
 		t.Fatalf("SYNC PID: got %#x, want 0x0002FFFF", p.Header.PID)
-	}
-}
-
-// TestSessionPIDNoUnderflow guards the 16-bit mask on the PID counter. The
-// device dedupes on PID and the high half is always zero in observed traffic;
-// without the mask the subtraction underflows after 65536 packets (~20min of
-// streaming) and starts setting those bits.
-func TestSessionPIDNoUnderflow(t *testing.T) {
-	s := NewSession()
-	for i := 0; i < 70000; i++ {
-		pkt := s.Send(NewHeartbeatBody())
-		if pkt.Header.PID > 0x0000FFFF {
-			t.Fatalf("packet %d: PID 0x%08X exceeds 16 bits", i, pkt.Header.PID)
-		}
 	}
 }
 
