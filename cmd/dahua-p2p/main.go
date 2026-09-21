@@ -215,19 +215,43 @@ func (b *bridge) serve(ctx context.Context, listener net.Listener) error {
 	}
 }
 
+// prewarmAttempts is how many times the first handshake is tried before the
+// process gives up. The cloud handshake against this device fails perhaps one
+// time in three, always as a read timeout part way through, and always
+// succeeds again shortly after. Exiting on the first one turned a routine
+// deploy into three container restarts and half a minute with no listener.
+// A genuinely wrong serial or password still fails every attempt and still
+// stops the process.
+const (
+	prewarmAttempts = 4
+	prewarmRetryGap = 3 * time.Second
+)
+
 // prewarm establishes the first tunnel at startup, synchronously, so bad
 // credentials or an unreachable device stop the process here rather than
 // surfacing as a failed stream minutes later. Its reservation becomes the
 // first spare; the warmer keeps the rest topped up.
 func (b *bridge) prewarm(ctx context.Context) error {
-	client, err := b.sessions.Acquire(b.clientConfig())
-	if err != nil {
-		return err
+	var err error
+	for attempt := 1; attempt <= prewarmAttempts; attempt++ {
+		var client *dahua.Client
+		if client, err = b.sessions.Acquire(b.clientConfig()); err == nil {
+			b.spare <- client
+			go b.warmTunnels(ctx)
+			log.Printf("Dahua P2P tunnel ready for serial %s", b.config.serial)
+			return nil
+		}
+		if attempt == prewarmAttempts {
+			break
+		}
+		log.Printf("prewarm attempt %d of %d: %v", attempt, prewarmAttempts, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(prewarmRetryGap):
+		}
 	}
-	b.spare <- client
-	go b.warmTunnels(ctx)
-	log.Printf("Dahua P2P tunnel ready for serial %s", b.config.serial)
-	return nil
+	return err
 }
 
 // warmTunnels keeps spareDepth reservations in hand, refilling each one the
