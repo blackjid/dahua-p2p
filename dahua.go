@@ -39,7 +39,7 @@ const (
 	NegotiateSettle    = 500 * time.Millisecond
 	minNegotiateSettle = 250 * time.Millisecond
 	deadTunnelSilence  = 12 * time.Second
-	maxBindFailures    = 2
+	maxBindFailures    = 1
 )
 
 // DefaultIdleTimeout is how long a tunnel persists after all streams
@@ -195,9 +195,15 @@ func (c *Client) RTSPPort() uint32 {
 }
 
 // Dial opens a new realm to the given port on the device. It closes a silent
-// tunnel or retires one that repeatedly refuses new realms, allowing the next
+// tunnel or retires one that refuses a new realm, allowing the next
 // SessionManager.Acquire call to establish a fresh tunnel without disrupting
 // existing realms that are still healthy.
+//
+// One timed-out Dial is enough to retire the tunnel. A tunnel can go deaf to
+// BINDs while the device keeps granting them on a sibling tunnel, and by the
+// time Dial gives up it has already spent its whole retry budget on fresh
+// realm IDs. Making a second caller spend that budget again only delays the
+// spill, with an RTSP client waiting on each attempt.
 func (c *Client) Dial(port uint32) (net.Conn, error) {
 	conn, err := c.tunnel.Dial(port)
 	if !errors.Is(err, ErrDialTimeout) {

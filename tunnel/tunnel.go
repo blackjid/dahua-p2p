@@ -758,8 +758,15 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 		return nil, ErrTunnelRetired
 	}
 
-	const maxRetries = 3
-	const retryTimeout = 5 * time.Second
+	// A BIND the device means to answer comes back in tens of milliseconds:
+	// 11ms median and 40ms worst over 16 measured realm opens. One still
+	// unanswered after two seconds was dropped, and only a fresh realm ID
+	// will do. The whole budget matters because Dial runs while an RTSP
+	// client is already waiting on its first response, under a deadline it
+	// sets itself -- five seconds in go2rtc -- so 3x5s spent here loses the
+	// stream even when the retry eventually works.
+	const maxRetries = 2
+	const retryTimeout = 2 * time.Second
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		realmID := t.randomRealmID()
