@@ -366,6 +366,17 @@ func (m *SessionManager) findAvailableSession(key sessionKey) *managedSession {
 		if s.client.IsRetired() {
 			continue
 		}
+		// A tunnel the device has stopped answering is neither closed nor
+		// retired for up to maxMissedHeartbeats -- two minutes -- and it goes
+		// on advertising free capacity for all of it. Handing it out spends
+		// another stream's whole BIND budget discovering what this one
+		// already knows; Dial only reaches the same conclusion afterwards,
+		// with an RTSP client waiting through it. Existing streams keep the
+		// tunnel, since it may yet come back and they have nowhere better to
+		// be, but nothing new is queued onto it.
+		if !s.client.IsResponsive(deadTunnelSilence) {
+			continue
+		}
 		// refCount is the number of producers that reserved this tunnel. A
 		// reservation is made before Dial, so concurrent startup cannot race
 		// past the realm cap.

@@ -159,6 +159,11 @@ func New(cfg Config) (*Tunnel, error) {
 		connCh:   make(map[uint32]chan bool),
 		trace:    nopLog,
 		errorf:   nopLog,
+		// The handshake just exchanged a PTCP SYNC with the device, so it was
+		// answering as of now. Without this the tunnel reads as unresponsive
+		// until the first heartbeat round lands, and anything gating on
+		// IsResponsive would refuse a tunnel that is seconds old.
+		lastAckTime: time.Now(),
 	}
 	if cfg.Trace != nil {
 		t.trace = cfg.Trace
@@ -581,6 +586,11 @@ func (t *Tunnel) ackHeartbeat() {
 	t.lastAckTime = now
 	t.lastAckTimeMu.Unlock()
 }
+
+// MarkResponsive records that the device answered just now. New sets it at
+// handshake; tests that build a Tunnel directly use it to describe a tunnel
+// the device is still talking to.
+func (t *Tunnel) MarkResponsive() { t.ackHeartbeat() }
 
 // IsResponsive returns true if the tunnel received a packet from the device
 // within the given duration. This indicates the device is not overloaded

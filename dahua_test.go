@@ -9,9 +9,17 @@ import (
 	"github.com/blackjid/dahua-p2p/tunnel"
 )
 
+// liveTunnel is a tunnel the device is currently answering. findAvailableSession
+// skips silent ones, so a fake that never acked would never be handed out.
+func liveTunnel() *tunnel.Tunnel {
+	t := &tunnel.Tunnel{}
+	t.MarkResponsive()
+	return t
+}
+
 func TestFindAvailableSessionUsesReservations(t *testing.T) {
 	key := sessionKeyFor(Config{Serial: "device", MaxRealms: 2})
-	client := &Client{tunnel: &tunnel.Tunnel{}}
+	client := &Client{tunnel: liveTunnel()}
 	session := &managedSession{client: client, refCount: 2, maxRealms: 2}
 	manager := NewSessionManager()
 	manager.sessions[key] = []*managedSession{session}
@@ -40,7 +48,7 @@ func TestFixedPortAtCapacityDoesNotOpenSecondTunnel(t *testing.T) {
 	key := sessionKeyFor(cfg)
 	manager := NewSessionManager()
 	manager.sessions[key] = []*managedSession{{
-		client:    &Client{tunnel: &tunnel.Tunnel{}},
+		client:    &Client{tunnel: liveTunnel()},
 		refCount:  1,
 		maxRealms: 1,
 	}}
@@ -99,7 +107,7 @@ func TestLockNegotiateGivesUpOnRetiredTunnel(t *testing.T) {
 func TestAcquireFreshIgnoresRoomOnLiveTunnels(t *testing.T) {
 	cfg := Config{Serial: "device", P2PPort: 5000, MaxRealms: 4}
 	key := sessionKeyFor(cfg)
-	client := &Client{tunnel: &tunnel.Tunnel{}}
+	client := &Client{tunnel: liveTunnel()}
 	manager := NewSessionManager()
 	manager.sessions[key] = []*managedSession{{client: client, maxRealms: 4}}
 
@@ -162,5 +170,43 @@ func TestSettleIntervalIsConfigurable(t *testing.T) {
 	}
 	if got := settleFor(Config{Serial: "device"}); got != NegotiateSettle {
 		t.Fatalf("settleFor(0) = %v, want the default %v", got, NegotiateSettle)
+	}
+}
+
+func TestSilentTunnelIsNotHandedToNewStreams(t *testing.T) {
+	key := sessionKeyFor(Config{Serial: "device", MaxRealms: 4})
+
+	// A tunnel the device has stopped answering. It is neither closed nor
+	// retired -- the heartbeat timeout allows two minutes before either --
+	// and it still has room, which is exactly how a dead tunnel collects
+	// streams that each spend a full BIND budget discovering it is dead.
+	silent := &managedSession{client: &Client{tunnel: &tunnel.Tunnel{}}, refCount: 1, maxRealms: 4}
+
+	manager := NewSessionManager()
+	manager.sessions[key] = []*managedSession{silent}
+
+	if got := manager.findAvailableSession(key); got != nil {
+		t.Fatal("a tunnel the device has gone silent on was handed to a new stream")
+	}
+
+	// It comes back into rotation the moment the device answers again.
+	silent.client.tunnel.MarkResponsive()
+	if got := manager.findAvailableSession(key); got != silent {
+		t.Fatal("a responsive tunnel with room was not handed out")
+	}
+}
+
+func TestSilentTunnelKeepsTheStreamsItHas(t *testing.T) {
+	key := sessionKeyFor(Config{Serial: "device", MaxRealms: 4})
+	silent := &managedSession{client: &Client{tunnel: &tunnel.Tunnel{}}, refCount: 2, maxRealms: 4}
+
+	manager := NewSessionManager()
+	manager.sessions[key] = []*managedSession{silent}
+	manager.findAvailableSession(key)
+
+	// Skipped, not evicted: the tunnel may yet come back, and the streams on
+	// it have nowhere better to be.
+	if got := manager.sessions[key]; len(got) != 1 || got[0] != silent {
+		t.Fatalf("silent session was dropped from the pool: %v", got)
 	}
 }
