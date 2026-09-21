@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/blackjid/dahua-p2p/dh"
@@ -90,6 +91,14 @@ type Tunnel struct {
 	// about whether the tunnel still works. peerRecv advancing does.
 	lastDrain     uint32
 	lastDrainTime time.Time
+	// drainPayload is payloadWrites as of the last drain, so the stall check
+	// can tell a device that consumes nothing from one that has simply been
+	// asked to consume nothing.
+	drainPayload uint64
+
+	// payloadWrites counts packets realms have written, as distinct from the
+	// heartbeats the tunnel emits on its own.
+	payloadWrites atomic.Uint64
 
 	// ACK coalescing: batch multiple received packets into a single ACK.
 	// ackMu also guards consecutiveSendErrs, which only flushACK touches.
@@ -182,8 +191,11 @@ func (t *Tunnel) RTSPPort() uint32 { return t.rtspPort }
 // reportLoss periodically logs our counters next to the device's view of
 // them. In a healthy tunnel the out/in gaps oscillate around a small
 // in-flight value; a gap that climbs monotonically across reports is loss,
-// and the direction says which way. Logged only while realms are active, so
-// an idle warm tunnel stays quiet.
+// and the direction says which way.
+//
+// An idle tunnel is reported too. Every health check the tunnel makes reads
+// these counters, and the decision they drive -- whether a tunnel with no
+// streams on it is still worth keeping -- is invisible without them.
 func (t *Tunnel) reportLoss() {
 	ticker := time.NewTicker(lossReportInterval)
 	defer ticker.Stop()
@@ -193,13 +205,13 @@ func (t *Tunnel) reportLoss() {
 		case <-t.done:
 			return
 		case <-ticker.C:
-			if t.ActiveRealms() == 0 {
-				continue
-			}
 			st := t.session.Stats()
-			t.trace("ptcp counters sent=%d peer_recv=%d out_unacked=%d out_msgs=%d recv=%d peer_sent=%d in_skew=%d realms=%d",
+			t.missedHeartbeatsMu.Lock()
+			missed := t.missedHeartbeats
+			t.missedHeartbeatsMu.Unlock()
+			t.trace("ptcp counters sent=%d peer_recv=%d out_unacked=%d out_msgs=%d recv=%d peer_sent=%d in_skew=%d missed_hb=%d realms=%d",
 				st.Sent, st.PeerRecv, st.OutBytes(), st.OutMsgs(),
-				st.Recv, st.PeerSent, st.InBytes(), t.ActiveRealms())
+				st.Recv, st.PeerSent, st.InBytes(), missed, t.ActiveRealms())
 		}
 	}
 }
@@ -245,6 +257,10 @@ func (t *Tunnel) sendPacketFor(body *ptcp.Body, writer *Conn) error {
 			_ = t.client.SetWriteDeadline(time.Time{})
 			t.writeDeadlineMu.Unlock()
 		}()
+	}
+
+	if body.Type == ptcp.BodyTypePayload {
+		t.payloadWrites.Add(1)
 	}
 
 	packet := t.session.Send(body)
@@ -457,27 +473,46 @@ const outboundStallTimeout = 20 * time.Second
 // its Recv counter freezes and nothing we send is taken.
 func (t *Tunnel) outboundStalled() bool {
 	st := t.session.Stats()
+	written := t.payloadWrites.Load()
 
 	// Nothing outstanding means nothing to be stalled on.
 	if st.OutBytes() <= 0 {
-		t.lastDrain = st.PeerRecv
-		t.lastDrainTime = time.Now()
+		t.markDrained(st.PeerRecv, written)
 		return false
 	}
 
 	if st.PeerRecv != t.lastDrain {
-		t.lastDrain = st.PeerRecv
-		t.lastDrainTime = time.Now()
+		t.markDrained(st.PeerRecv, written)
 		return false
 	}
 
 	// First observation of a non-draining tunnel starts the clock.
 	if t.lastDrainTime.IsZero() {
+		t.markDrained(t.lastDrain, written)
+		return false
+	}
+
+	// A tunnel nobody has written to proves nothing. The device stops
+	// advancing its Recv counter over an idle tunnel even while it is
+	// perfectly willing to serve the next BIND -- observed closing a tunnel
+	// with two live realms thirty seconds after its last RTSP exchange. Only
+	// realm data the device declines to take is evidence of a stall; total
+	// silence is the missed-heartbeat timeout's business, and it allows six
+	// times as long before concluding anything.
+	if written == t.drainPayload {
 		t.lastDrainTime = time.Now()
 		return false
 	}
 
 	return time.Since(t.lastDrainTime) > outboundStallTimeout
+}
+
+// markDrained restarts the stall clock. Must be called from the heartbeat
+// goroutine, which is the only caller of outboundStalled.
+func (t *Tunnel) markDrained(peerRecv uint32, written uint64) {
+	t.lastDrain = peerRecv
+	t.lastDrainTime = time.Now()
+	t.drainPayload = written
 }
 
 // sendHeartbeat sends a heartbeat packet and tracks missed responses.
@@ -507,9 +542,8 @@ func (t *Tunnel) sendHeartbeat() {
 	// Checked after sending so the freshly queued heartbeat counts toward the
 	// outstanding bytes the device ought to consume.
 	if t.outboundStalled() {
-		st := t.session.Stats()
 		t.errorf("device stopped consuming our data (unacked=%d for >%s), closing tunnel",
-			st.OutBytes(), outboundStallTimeout)
+			t.session.Stats().OutBytes(), outboundStallTimeout)
 		t.Close()
 	}
 }
