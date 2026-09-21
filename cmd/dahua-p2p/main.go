@@ -35,6 +35,13 @@ const (
 	// bridge that can actually answer it.
 	admitTimeout = 3 * time.Second
 
+	// maxSettleWait is how much of the client's remaining patience may be
+	// spent waiting for the device to be ready for another realm. Waiting
+	// happens under the negotiate lock, so anything longer starves every
+	// other stream as well; past it we turn this one away at once and let it
+	// retry, which costs it a reconnect instead of costing all of them.
+	maxSettleWait = time.Second
+
 	// logInterval is the minimum gap between repeats of a throttled line.
 	logInterval = 5 * time.Second
 
@@ -543,8 +550,9 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 var errLostContact = errors.New("device unreachable")
 
 var (
-	errAdmitTimeout  = errors.New("waiting for negotiate lock")
-	errRealmCapacity = errors.New("realm capacity reached")
+	errAdmitTimeout   = errors.New("waiting for negotiate lock")
+	errRealmCapacity  = errors.New("realm capacity reached")
+	errDeviceSettling = errors.New("device not ready for another realm")
 )
 
 // refusalReason names the failure for the refusal log. RTSP gives the client
@@ -556,6 +564,8 @@ func refusalReason(err error) string {
 		return "negotiate lock busy"
 	case errors.Is(err, errRealmCapacity):
 		return "realm capacity"
+	case errors.Is(err, errDeviceSettling):
+		return "device settling"
 	case errors.Is(err, dahua.ErrDialTimeout):
 		return "device refusing realms"
 	case errors.Is(err, dahua.ErrTunnelRetired):
@@ -580,6 +590,15 @@ func (b *bridge) openRealm(ctx context.Context) (net.Conn, func(), error) {
 	if n := b.client.ActiveRealms(); n >= b.config.maxRealms {
 		b.client.UnlockNegotiate()
 		return nil, nil, fmt.Errorf("%w: %d/%d", errRealmCapacity, n, b.config.maxRealms)
+	}
+
+	// The device goes quiet for seconds after granting a realm. Waiting that
+	// out holds the negotiate lock, so wait only what this client can afford
+	// and stand down beyond it rather than taking every other stream down
+	// with us.
+	if wait := b.client.SettleRemaining(); wait > maxSettleWait {
+		b.client.UnlockNegotiate()
+		return nil, nil, fmt.Errorf("%w: ready in %s", errDeviceSettling, wait.Round(time.Millisecond))
 	}
 	b.client.WaitSettle()
 

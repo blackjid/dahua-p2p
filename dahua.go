@@ -39,11 +39,24 @@ var ErrFixedPortCapacity = errors.New("fixed P2P port tunnel is at capacity")
 // device needs a breather after a DESCRIBE before it will answer the next
 // BIND reliably. minNegotiateSettle is used when the device is still
 // answering heartbeats, which indicates it is not yet saturated.
+//
+// A stressed device needs far longer than either. Observed: after granting a
+// realm it answers nothing for seven to thirteen seconds, then grants the
+// next in about twenty milliseconds. A BIND sent into that window is not
+// merely wasted; it holds the negotiate lock for a whole dial budget, so
+// every other stream queued behind it times out too. maxNegotiateSettle caps
+// how far the gap grows while the device stays silent.
 const (
 	NegotiateSettle    = 500 * time.Millisecond
 	minNegotiateSettle = 250 * time.Millisecond
+	maxNegotiateSettle = 16 * time.Second
 	deadTunnelSilence  = 12 * time.Second
-	maxBindFailures    = 2
+
+	// A device that ignores BINDs recovers on its own, so retiring the tunnel
+	// over a few of them costs a cloud handshake and strands the session we
+	// were using. Only give up once the settle has been at its cap for
+	// several rounds, which is roughly two minutes of genuine attempts.
+	maxBindFailures = 10
 )
 
 // DefaultIdleTimeout is how long a tunnel persists after all streams
@@ -145,20 +158,50 @@ func (c *Client) UnlockNegotiate() {
 }
 
 // WaitSettle sleeps until the device is ready for a new RTSP negotiation.
-// Must be called while holding the negotiate lock.
+// Must be called while holding the negotiate lock. Callers that cannot afford
+// to hold the lock that long should check SettleRemaining first.
 func (c *Client) WaitSettle() {
-	if c.lastNegotiate.IsZero() {
-		return
-	}
-
-	settle := NegotiateSettle
-	if c.tunnel.IsResponsive(2 * time.Second) {
-		settle = minNegotiateSettle
-	}
-
-	if wait := settle - time.Since(c.lastNegotiate); wait > 0 {
+	if wait := c.SettleRemaining(); wait > 0 {
 		time.Sleep(wait)
 	}
+}
+
+// SettleRemaining reports how long until the device should answer another
+// BIND. It grows while the device is ignoring them, so a caller holding the
+// negotiate lock can decide to stand down instead of spending the lock on a
+// BIND that will go unanswered. Must be called while holding the lock.
+func (c *Client) SettleRemaining() time.Duration {
+	if c.lastNegotiate.IsZero() {
+		return 0
+	}
+	return c.settle() - time.Since(c.lastNegotiate)
+}
+
+// settle is the gap the device wants before the next realm negotiation.
+func (c *Client) settle() time.Duration {
+	return settleFor(c.tunnel.BindFailures(), c.tunnel.IsResponsive(2*time.Second))
+}
+
+// settleFor is the gap after the given number of consecutive unanswered
+// BINDs. Each one doubles it: silence is the device saying it is not ready,
+// and asking sooner does not get a realm, it spends another dial budget under
+// the negotiate lock and takes every queued stream down with it. A granted
+// realm resets failures to zero, so recovery is immediate.
+func settleFor(failures int, responsive bool) time.Duration {
+	if failures > 0 {
+		if failures > 16 {
+			return maxNegotiateSettle
+		}
+		settle := NegotiateSettle << uint(failures)
+		if settle > maxNegotiateSettle || settle <= 0 {
+			return maxNegotiateSettle
+		}
+		return settle
+	}
+	if responsive {
+		return minNegotiateSettle
+	}
+	return NegotiateSettle
 }
 
 // DoneNegotiate records the end of an RTSP negotiation.
@@ -233,9 +276,19 @@ func (c *Client) Dial(port uint32) (net.Conn, error) {
 		c.reportError("device silent, closing tunnel")
 		c.tunnel.LoseContact()
 	case c.tunnel.BindFailures() >= maxBindFailures:
+		// The device answers heartbeats but has refused realms for long
+		// enough that waiting is no longer paying. Existing streams keep
+		// running; only new ones are turned away.
 		c.reportError("tunnel not granting realms, retiring (bind_failures=%d realms=%d)",
 			c.tunnel.BindFailures(), c.tunnel.ActiveRealms())
 		c.tunnel.Retire()
+	default:
+		// Ignored BINDs on their own are not a failure: the device goes quiet
+		// for a few seconds after each realm it grants. The settle above backs
+		// off on its own, so the tunnel stays up and streams resume once the
+		// device is ready.
+		c.reportError("device not ready for a new realm (bind_failures=%d realms=%d, next attempt in %s)",
+			c.tunnel.BindFailures(), c.tunnel.ActiveRealms(), c.settle())
 	}
 	return nil, err
 }
