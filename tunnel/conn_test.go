@@ -225,3 +225,32 @@ func TestRemoteAddrUsesDialPort(t *testing.T) {
 		t.Fatalf("RemoteAddr port = %d, want 8554", got)
 	}
 }
+
+// A device that answers a BIND after Dial gave up leaves a realm open that no
+// Conn owns. The reader has to notice, or the device's finite realm slots leak
+// away one abandoned retry at a time.
+func TestAcceptConnectDetectsOrphanRealm(t *testing.T) {
+	tn := &Tunnel{connCh: map[uint32]chan bool{}}
+
+	waiter := make(chan bool, 1)
+	tn.connCh[7] = waiter
+
+	if !tn.acceptConnect(7) {
+		t.Fatal("acceptConnect(7) = false, want true for the realm Dial is waiting on")
+	}
+	if !<-waiter {
+		t.Fatal("the waiting Dial was not signalled")
+	}
+	if _, still := tn.connCh[7]; still {
+		t.Fatal("acceptConnect left the waiter installed")
+	}
+
+	// The same grant arriving twice, or one for a realm Dial abandoned, is an
+	// orphan the caller must disconnect.
+	if tn.acceptConnect(7) {
+		t.Fatal("acceptConnect(7) = true on a second grant, want false")
+	}
+	if tn.acceptConnect(99) {
+		t.Fatal("acceptConnect(99) = true for a realm nobody dialled, want false")
+	}
+}

@@ -24,6 +24,10 @@ var ErrDialTimeout = tunnel.ErrDialTimeout
 // a fresh tunnel rather than treating it as a failure.
 var ErrTunnelRetired = tunnel.ErrTunnelRetired
 
+// ErrTunnelClosed is returned by Dial once the tunnel is gone. Callers should
+// rebuild rather than retry.
+var ErrTunnelClosed = tunnel.ErrTunnelClosed
+
 // ErrSessionManagerClosed is returned by Acquire after CloseAll has started.
 var ErrSessionManagerClosed = errors.New("dahua session manager closed")
 
@@ -76,6 +80,16 @@ type Config struct {
 	P2PPort   int // Fixed local UDP port for P2P (0 = random)
 	MaxRealms int // Max concurrent realms per tunnel (0 = DefaultMaxRealmsPerTunnel)
 
+	// BindRetries and BindTimeout bound one Dial. Their product is held
+	// under the tunnel's dial lock, so it must fit inside the patience of
+	// the RTSP client waiting on it. Zero picks the tunnel defaults.
+	BindRetries int
+	BindTimeout time.Duration
+
+	// LossReportInterval is how often to trace both endpoints' PTCP counters
+	// while realms are active. Zero picks the tunnel default.
+	LossReportInterval time.Duration
+
 	// Trace and Error report protocol activity. This package owns no logger,
 	// so the caller wires them to one; while nil, nothing is formatted.
 	Trace func(format string, v ...any)
@@ -89,13 +103,18 @@ func ConnectWithConfig(cfg Config) (*Client, error) {
 	}
 
 	t, err := tunnel.New(tunnel.Config{
-		Serial:   cfg.Serial,
-		Username: cfg.Username,
-		Password: cfg.Password,
-		Timeout:  cfg.Timeout,
-		P2PPort:  cfg.P2PPort,
-		Trace:    cfg.Trace,
-		Error:    cfg.Error,
+		Serial:      cfg.Serial,
+		Username:    cfg.Username,
+		Password:    cfg.Password,
+		Timeout:     cfg.Timeout,
+		P2PPort:     cfg.P2PPort,
+		BindRetries: cfg.BindRetries,
+		BindTimeout: cfg.BindTimeout,
+
+		LossReportInterval: cfg.LossReportInterval,
+
+		Trace: cfg.Trace,
+		Error: cfg.Error,
 	})
 	if err != nil {
 		return nil, err

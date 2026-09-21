@@ -72,6 +72,14 @@ type Tunnel struct {
 	// liveness alone is not proof the tunnel is still usable.
 	bindFailures int
 
+	// How long one Dial may spend on a realm, fixed at construction. Held
+	// under dialMu for the whole attempt, so it is also the worst case every
+	// other queued stream waits.
+	bindRetries int
+	bindTimeout time.Duration
+
+	lossReportInterval time.Duration
+
 	// Heartbeat
 	heartbeatTicker *time.Ticker
 
@@ -116,6 +124,20 @@ type Config struct {
 	Timeout  time.Duration
 	P2PPort  int // Fixed local UDP port for P2P (0 = random)
 
+	// BindRetries and BindTimeout bound how long Dial spends on one realm.
+	// Their product is time the negotiate lock is held, so it has to fit
+	// inside the patience of whatever RTSP client is waiting: a budget
+	// longer than the client's own timeout poisons every queued stream to
+	// no benefit, because the client has already gone. Zero picks the
+	// defaults below.
+	BindRetries int
+	BindTimeout time.Duration
+
+	// LossReportInterval is how often to trace both endpoints' counters while
+	// realms are active. Zero picks lossReportInterval. Shorten it to catch
+	// the moment a tunnel wedges, which a 30s sample can step right over.
+	LossReportInterval time.Duration
+
 	// Trace and Error report protocol activity. This package owns no logger,
 	// so the caller wires them to one; while nil, nothing is formatted.
 	Trace func(format string, v ...any)
@@ -126,6 +148,15 @@ type Config struct {
 func New(cfg Config) (*Tunnel, error) {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 10 * time.Second
+	}
+	if cfg.BindRetries <= 0 {
+		cfg.BindRetries = defaultBindRetries
+	}
+	if cfg.BindTimeout <= 0 {
+		cfg.BindTimeout = defaultBindTimeout
+	}
+	if cfg.LossReportInterval <= 0 {
+		cfg.LossReportInterval = lossReportInterval
 	}
 
 	result, err := dh.Handshake(dh.HandshakeOptions{
@@ -149,6 +180,11 @@ func New(cfg Config) (*Tunnel, error) {
 		connCh:   make(map[uint32]chan bool),
 		trace:    nopLog,
 		errorf:   nopLog,
+
+		bindRetries: cfg.BindRetries,
+		bindTimeout: cfg.BindTimeout,
+
+		lossReportInterval: cfg.LossReportInterval,
 	}
 	if cfg.Trace != nil {
 		t.trace = cfg.Trace
@@ -169,6 +205,14 @@ func New(cfg Config) (*Tunnel, error) {
 	return t, nil
 }
 
+// A BIND on a healthy tunnel is answered well inside a second, so the budget
+// exists only to ride out UDP loss. Two attempts of two seconds stay under
+// the five seconds RTSP clients typically allow a single command.
+const (
+	defaultBindRetries = 2
+	defaultBindTimeout = 2 * time.Second
+)
+
 // lossReportInterval is how often the tunnel reports both endpoints' view of
 // the byte counters, so persistent divergence (i.e. packet loss) is visible.
 const lossReportInterval = 30 * time.Second
@@ -185,7 +229,11 @@ func (t *Tunnel) RTSPPort() uint32 { return t.rtspPort }
 // and the direction says which way. Logged only while realms are active, so
 // an idle warm tunnel stays quiet.
 func (t *Tunnel) reportLoss() {
-	ticker := time.NewTicker(lossReportInterval)
+	interval := t.lossReportInterval
+	if interval <= 0 {
+		interval = lossReportInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -508,8 +556,13 @@ func (t *Tunnel) sendHeartbeat() {
 	// outstanding bytes the device ought to consume.
 	if t.outboundStalled() {
 		st := t.session.Stats()
-		t.errorf("device stopped consuming our data (unacked=%d for >%s), closing tunnel",
-			st.OutBytes(), outboundStallTimeout)
+		// in_skew says whether the device also stopped reaching us. Both
+		// directions failing together points at the UDP path; only outbound
+		// failing points at the device's receive side.
+		t.errorf("device stopped consuming our data (unacked=%d for >%s), closing tunnel: "+
+			"sent=%d peer_recv=%d out_msgs=%d recv=%d peer_sent=%d in_skew=%d realms=%d",
+			st.OutBytes(), outboundStallTimeout,
+			st.Sent, st.PeerRecv, st.OutMsgs(), st.Recv, st.PeerSent, st.InBytes(), t.ActiveRealms())
 		t.Close()
 	}
 }
@@ -593,14 +646,16 @@ func (t *Tunnel) reader() {
 			t.trace("PTCP status realm=%d status=%s", realm, status)
 
 			if status == ptcp.StatusConnect {
-				t.connChMu.Lock()
-				if ch, ok := t.connCh[realm]; ok {
-					ch <- true
-					delete(t.connCh, realm)
-				} else {
-					t.errorf("reader: StatusConnect for unknown realm=%d", realm)
+				if !t.acceptConnect(realm) {
+					// A BIND we had already given up on was answered after
+					// Dial retried under a fresh realm ID. The device now
+					// holds a realm nobody will ever read from, and its
+					// realm slots are few: hand it back instead of leaking
+					// it, or the device runs out and refuses every later
+					// BIND.
+					t.errorf("reclaiming realm granted after bind timeout realm=%d", realm)
+					_ = t.sendPacket(ptcp.NewStatusBody(realm, ptcp.StatusDisconnect))
 				}
-				t.connChMu.Unlock()
 			} else if status == ptcp.StatusDisconnect {
 				// Device initiated disconnect: signal the Conn and remove realm.
 				t.realmsMu.Lock()
@@ -712,6 +767,22 @@ func (t *Tunnel) randomRealmID() uint32 {
 	}
 }
 
+// acceptConnect hands a granted realm to the Dial waiting for it and reports
+// whether one was waiting. A false result means the grant is an orphan: Dial
+// timed out and moved on to a fresh realm ID, so nothing will ever read from
+// this one.
+func (t *Tunnel) acceptConnect(realm uint32) bool {
+	t.connChMu.Lock()
+	defer t.connChMu.Unlock()
+	ch, waiting := t.connCh[realm]
+	if !waiting {
+		return false
+	}
+	ch <- true
+	delete(t.connCh, realm)
+	return true
+}
+
 // BindFailures returns how many consecutive Dial calls have exhausted their
 // BIND retries. Reset to zero by any successful Dial.
 func (t *Tunnel) BindFailures() int {
@@ -758,8 +829,14 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 		return nil, ErrTunnelRetired
 	}
 
-	const maxRetries = 3
-	const retryTimeout = 5 * time.Second
+	// A Tunnel built directly rather than through New carries no budget.
+	maxRetries, retryTimeout := t.bindRetries, t.bindTimeout
+	if maxRetries <= 0 {
+		maxRetries = defaultBindRetries
+	}
+	if retryTimeout <= 0 {
+		retryTimeout = defaultBindTimeout
+	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		realmID := t.randomRealmID()

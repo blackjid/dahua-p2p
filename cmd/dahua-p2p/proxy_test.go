@@ -3,12 +3,55 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"net"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestSuperviseRestartsBridgeCycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	wantErr := errors.New("tunnel failed")
+
+	err := supervise(ctx, 0, 0, func(context.Context) error {
+		calls++
+		if calls == 2 {
+			cancel()
+			return nil
+		}
+		return wantErr
+	})
+	if err != nil {
+		t.Fatalf("supervise() error = %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("run cycle calls = %d, want 2", calls)
+	}
+}
+
+func TestNextBackoff(t *testing.T) {
+	tests := []struct {
+		name    string
+		current time.Duration
+		max     time.Duration
+		want    time.Duration
+	}{
+		{name: "double", current: time.Second, max: 30 * time.Second, want: 2 * time.Second},
+		{name: "cap", current: 16 * time.Second, max: 30 * time.Second, want: 30 * time.Second},
+		{name: "stay capped", current: 30 * time.Second, max: 30 * time.Second, want: 30 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := nextBackoff(tt.current, tt.max); got != tt.want {
+				t.Errorf("nextBackoff(%s, %s) = %s, want %s", tt.current, tt.max, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestCopyRTSPMessage(t *testing.T) {
 	tests := []struct {

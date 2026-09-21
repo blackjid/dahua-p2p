@@ -51,9 +51,9 @@ streams:
 Run one bridge per Dahua device or NVR. Different channels and subtypes can
 share that bridge and its P2P tunnel. The bridge establishes and owns one P2P
 tunnel before it opens the RTSP listener, so the first RTSP client does not pay
-the cloud handshake cost. If the initial handshake fails, the process exits so
-the container runtime can restart it. If that tunnel later dies or retires, the
-bridge also exits instead of starting a competing tunnel for the same device.
+the cloud handshake cost. If the handshake fails or the tunnel later dies, the
+bridge reconnects with a capped backoff. The process exits only on shutdown, so
+it behaves the same under Docker, Docker Compose, systemd, and Kubernetes.
 
 | Environment | Flag | Default | Purpose |
 |---|---|---:|---|

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -23,6 +24,8 @@ import (
 const (
 	initialRequestTimeout = 10 * time.Second
 	negotiateTimeout      = 90 * time.Second
+	reconnectMinDelay     = time.Second
+	reconnectMaxDelay     = 30 * time.Second
 	defaultMaxConnections = 32
 )
 
@@ -62,6 +65,12 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return supervise(ctx, reconnectMinDelay, reconnectMaxDelay, func(ctx context.Context) error {
+		return runBridge(ctx, cfg)
+	})
+}
+
+func runBridge(ctx context.Context, cfg config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -72,7 +81,7 @@ func run() error {
 		connections: make(map[net.Conn]struct{}),
 	}
 
-	if err = b.connect(); err != nil {
+	if err := b.connect(); err != nil {
 		return fmt.Errorf("connect P2P tunnel: %w", err)
 	}
 	b.client.SetOnClose(cancel)
@@ -86,6 +95,43 @@ func run() error {
 
 	log.Printf("Dahua P2P bridge listening on %s for serial %s", listener.Addr(), cfg.serial)
 	return b.serve(ctx, listener)
+}
+
+func supervise(ctx context.Context, minDelay, maxDelay time.Duration, runCycle func(context.Context) error) error {
+	delay := minDelay
+	for {
+		err := runCycle(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err != nil {
+			log.Printf("Dahua P2P bridge stopped: %v", err)
+		} else {
+			log.Printf("Dahua P2P tunnel closed")
+			delay = minDelay
+		}
+		log.Printf("reconnecting in %s", delay)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil
+		case <-timer.C:
+		}
+		if err != nil {
+			delay = nextBackoff(delay, maxDelay)
+		}
+	}
+}
+
+func nextBackoff(delay, maxDelay time.Duration) time.Duration {
+	if delay >= maxDelay/2 {
+		return maxDelay
+	}
+	return delay * 2
 }
 
 func connectionLimit(cfg config) int {
@@ -215,8 +261,8 @@ func (b *bridge) serve(ctx context.Context, listener net.Listener) error {
 }
 
 // connect establishes the bridge's single persistent tunnel before the RTSP
-// listener opens. A closed or retired tunnel ends the process so the container
-// runtime can establish a clean replacement.
+// listener opens. A closed or retired tunnel ends this bridge cycle so the
+// supervisor can establish a clean replacement.
 func (b *bridge) connect() error {
 	client, err := dahua.ConnectWithConfig(b.clientConfig())
 	if err != nil {
@@ -282,7 +328,9 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 	var firstRequest bytes.Buffer
 	requestLine, err := copyRTSPMessage(&firstRequest, upstreamReader)
 	if err != nil {
-		log.Printf("read initial RTSP request from %s: %v", upstream.RemoteAddr(), err)
+		if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			log.Printf("read initial RTSP request from %s: %v", upstream.RemoteAddr(), err)
+		}
 		return
 	}
 	if !validRTSPRequest(requestLine) {
