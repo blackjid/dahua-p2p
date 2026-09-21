@@ -580,12 +580,17 @@ func (t *Tunnel) sendHeartbeat() {
 	// outstanding bytes the device ought to consume.
 	if t.outboundStalled() {
 		st := t.session.Stats()
-		// in_skew says whether the device also stopped reaching us. Both
-		// directions failing together points at the UDP path; only outbound
-		// failing points at the device's receive side.
-		t.errorf("device stopped consuming our data (unacked=%d for >%s), closing tunnel: "+
+		// Naming which side stopped saves reading the counters to find out.
+		// A device that is still sending while ignoring what we send is a
+		// receive-side failure on the device; one that has stopped in both
+		// directions has gone away, and the UDP path is the first suspect.
+		cause := "device stopped consuming our data"
+		if !t.IsResponsive(outboundStallTimeout) {
+			cause = "device stopped sending and receiving"
+		}
+		t.errorf("%s (unacked=%d for >%s), closing tunnel: "+
 			"sent=%d peer_recv=%d out_lag_ms=%d recv=%d peer_sent=%d in_skew=%d realms=%d",
-			st.OutBytes(), outboundStallTimeout,
+			cause, st.OutBytes(), outboundStallTimeout,
 			st.Sent, st.PeerRecv, st.OutLagMillis(), st.Recv, st.PeerSent, st.InBytes(), t.ActiveRealms())
 		t.LoseContact()
 	}

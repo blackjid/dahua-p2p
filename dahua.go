@@ -35,13 +35,21 @@ var ErrSessionManagerClosed = errors.New("dahua session manager closed")
 // full. A second tunnel cannot bind the same local port concurrently.
 var ErrFixedPortCapacity = errors.New("fixed P2P port tunnel is at capacity")
 
-// MaxConcurrentNegotiations is how many RTSP negotiations may run against one
-// tunnel at a time. A DMSS capture shows the device opening seventeen realms
-// with three or four BINDs in flight at once, each answered in 10-30ms, so
-// admitting one stream at a time was costing cold-start latency for nothing.
-// The limit remains because the admission it provides is what turns a stream
-// away while its client is still listening, rather than after it has gone.
-const MaxConcurrentNegotiations = 4
+// DefaultMaxNegotiations is how many RTSP negotiations may run against one
+// tunnel at a time.
+//
+// Concurrent BINDs are safe: the capture shows seventeen realms opened three
+// or four at a time, every one granted in 10-30ms. Concurrent RTSP is a
+// separate question the capture does not answer, because every realm in it
+// binds port 37777 (DVRIP) and not one binds 554. Raising this to 4 on a live
+// device cost us the tunnel twice: five realms were granted instantly, a few
+// kB of RTSP setup crossed, and then the device stopped both sending and
+// receiving while the counters froze in place.
+//
+// So the default returns to one negotiation at a time, which is what the
+// device was observed to tolerate. Config.MaxNegotiations raises it for
+// anyone whose firmware turns out to take more.
+const DefaultMaxNegotiations = 1
 
 const (
 	deadTunnelSilence = 12 * time.Second
@@ -68,10 +76,9 @@ const DefaultMaxRealmsPerTunnel = 8
 
 // Client represents a P2P connection to a Dahua device.
 //
-// RTSP negotiations run a few at a time per client, bounded by
-// MaxConcurrentNegotiations. A buffered channel is used as a
-// context-cancellable semaphore so a caller can give up rather than wedge
-// forever behind a stuck negotiation.
+// RTSP negotiations are bounded per client by Config.MaxNegotiations. A
+// buffered channel is used as a context-cancellable semaphore so a caller can
+// give up rather than wedge forever behind a stuck negotiation.
 type Client struct {
 	tunnel       *tunnel.Tunnel
 	negotiateSem chan struct{} // holds a token per in-flight negotiation
@@ -86,6 +93,12 @@ type Config struct {
 	Timeout   time.Duration
 	P2PPort   int // Fixed local UDP port for P2P (0 = random)
 	MaxRealms int // Max concurrent realms per tunnel (0 = DefaultMaxRealmsPerTunnel)
+
+	// MaxNegotiations is how many RTSP negotiations may run at once against
+	// this client. Zero picks DefaultMaxNegotiations. Each slot is held for a
+	// whole DESCRIBE/SETUP/PLAY, not just the BIND, so raising it puts several
+	// RTSP sessions on the device at the same instant.
+	MaxNegotiations int
 
 	// BindRetries and BindTimeout bound one Dial. Their product is held
 	// under the tunnel's dial lock, so it must fit inside the patience of
@@ -127,9 +140,14 @@ func ConnectWithConfig(cfg Config) (*Client, error) {
 		return nil, err
 	}
 
+	negotiations := cfg.MaxNegotiations
+	if negotiations <= 0 {
+		negotiations = DefaultMaxNegotiations
+	}
+
 	return &Client{
 		tunnel:       t,
-		negotiateSem: make(chan struct{}, MaxConcurrentNegotiations),
+		negotiateSem: make(chan struct{}, negotiations),
 		errorf:       cfg.Error,
 	}, nil
 }

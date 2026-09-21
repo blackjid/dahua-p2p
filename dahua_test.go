@@ -68,21 +68,22 @@ func TestSessionKeyIncludesTunnelConfiguration(t *testing.T) {
 	}
 }
 
-// A DMSS capture shows the device answering three or four overlapping BINDs
-// in 10-30ms each while opening seventeen realms, so realm setup is not paced
-// and several negotiations may be in flight at once. The bound exists only so
-// a stream that cannot be served is refused while its client is still there.
-func TestNegotiationsRunConcurrentlyButBounded(t *testing.T) {
-	if MaxConcurrentNegotiations < 2 {
-		t.Fatalf("MaxConcurrentNegotiations = %d, want realm setup to overlap",
-			MaxConcurrentNegotiations)
+// Every realm in the capture binds port 37777, so it shows concurrent BINDs
+// are safe and says nothing about concurrent RTSP. Raising this to 4 against a
+// live device lost the tunnel twice, so the default is one at a time and the
+// bound is configurable for firmware that takes more.
+func TestNegotiationsAreSerializedByDefault(t *testing.T) {
+	if DefaultMaxNegotiations != 1 {
+		t.Fatalf("DefaultMaxNegotiations = %d, want RTSP negotiation serialized until a device is shown to take more",
+			DefaultMaxNegotiations)
 	}
 
-	c := &Client{negotiateSem: make(chan struct{}, MaxConcurrentNegotiations)}
+	const bound = 3
+	c := &Client{negotiateSem: make(chan struct{}, bound)}
 	ctx := context.Background()
-	for i := 0; i < MaxConcurrentNegotiations; i++ {
+	for i := 0; i < bound; i++ {
 		if err := c.LockNegotiate(ctx); err != nil {
-			t.Fatalf("LockNegotiate %d of %d: %v", i+1, MaxConcurrentNegotiations, err)
+			t.Fatalf("LockNegotiate %d of %d: %v", i+1, bound, err)
 		}
 	}
 

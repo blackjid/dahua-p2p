@@ -64,6 +64,7 @@ it behaves the same under Docker, Docker Compose, systemd, and Kubernetes.
 | `LISTEN_ADDR` | `-listen` | `:8554` | RTSP TCP listen address |
 | `DAHUA_P2P_PORT` | `-p2p-port` | `0` | Fixed local UDP port; `0` chooses one |
 | `DAHUA_MAX_REALMS` | `-max-realms` | `8` | Connections per shared P2P tunnel |
+| `DAHUA_MAX_NEGOTIATIONS` | `-max-negotiations` | `1` | RTSP negotiations run at once against the device |
 | `DAHUA_MAX_CONNECTIONS` | `-max-connections` | `32` | Total concurrent RTSP clients |
 
 Use `-debug` to print protocol traces.
@@ -155,6 +156,13 @@ packets arrive 0.44ms apart at the median.
 Realm setup is not paced. The same capture opens seventeen realms with three
 or four BINDs in flight at once, each answered in 10-30ms, and tears all
 seventeen down in 60ms. `Dial` is safe to call concurrently.
+
+Concurrent *RTSP* is a different question, and the capture does not answer it:
+every realm in it binds port 37777 (DVRIP), none binds 554. Running four RTSP
+negotiations at once against a real device lost the tunnel twice — realms were
+granted instantly, a few kB of setup crossed, then the device stopped both
+sending and receiving. `DAHUA_MAX_NEGOTIATIONS` defaults to 1 for that reason;
+raise it if your firmware takes more.
 
 ## Measuring loss
 

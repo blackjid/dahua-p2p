@@ -59,6 +59,7 @@ type config struct {
 	p2pPort   int
 	maxRealms int
 	maxConns  int
+	maxNegot  int
 	timeout   time.Duration
 
 	bindRetries  int
@@ -275,6 +276,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	maxNegot, err := envInt("DAHUA_MAX_NEGOTIATIONS", dahua.DefaultMaxNegotiations)
+	if err != nil {
+		return config{}, err
+	}
 	bindRetries, err := envInt("DAHUA_BIND_RETRIES", 0)
 	if err != nil {
 		return config{}, err
@@ -295,6 +300,7 @@ func loadConfig() (config, error) {
 	flag.IntVar(&cfg.p2pPort, "p2p-port", p2pPort, "fixed local UDP port; zero chooses one automatically")
 	flag.IntVar(&cfg.maxRealms, "max-realms", maxRealms, "maximum concurrent RTSP connections per P2P tunnel")
 	flag.IntVar(&cfg.maxConns, "max-connections", maxConns, "maximum concurrent RTSP client connections")
+	flag.IntVar(&cfg.maxNegot, "max-negotiations", maxNegot, "RTSP negotiations allowed to run at once against the device")
 	flag.DurationVar(&cfg.timeout, "timeout", 10*time.Second, "P2P handshake timeout")
 	flag.DurationVar(&cfg.countersEach, "counters-interval", countersEach, "how often to trace PTCP counters; needs -debug")
 	flag.IntVar(&cfg.bindRetries, "bind-retries", bindRetries, "attempts to open one P2P realm before giving up")
@@ -319,6 +325,8 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("p2p port must be between 0 and 65535: %d", cfg.p2pPort)
 	case cfg.maxRealms < 1:
 		return config{}, fmt.Errorf("max realms must be positive: %d", cfg.maxRealms)
+	case cfg.maxNegot < 1:
+		return config{}, fmt.Errorf("max negotiations must be positive: %d", cfg.maxNegot)
 	case cfg.maxConns < 1:
 		return config{}, fmt.Errorf("max connections must be positive: %d", cfg.maxConns)
 	case cfg.timeout <= 0:
@@ -436,9 +444,10 @@ func (b *bridge) clientConfig() dahua.Config {
 		P2PPort:   b.config.p2pPort,
 		MaxRealms: b.config.maxRealms,
 
-		// The budget is held under the tunnel's dial lock, so it is also how
-		// long every other queued stream waits on a device that has stopped
-		// answering. Keep it inside an RTSP client's patience.
+		MaxNegotiations: b.config.maxNegot,
+
+		// The budget bounds one caller's dial. Keep it inside an RTSP
+		// client's patience.
 		BindRetries: b.config.bindRetries,
 		BindTimeout: b.config.bindTimeout,
 
