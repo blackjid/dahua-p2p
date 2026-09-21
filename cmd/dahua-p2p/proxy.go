@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -25,12 +26,19 @@ func proxyRTSP(
 	finishNegotiation func(),
 ) error {
 	deviceReader := bufio.NewReaderSize(device, maxRTSPHeaderBytes)
+	sent := time.Now()
 	if err := writeAll(device, firstRequest); err != nil {
 		return err
 	}
 
 	for {
 		responseLine, err := copyRTSPMessage(upstream, deviceReader)
+		// Every command the client sends is round-tripped to the device here,
+		// and an RTSP client applies its own deadline to each one. go2rtc
+		// hardcodes five seconds, so a command the device answers more slowly
+		// than that is abandoned no matter how healthy the tunnel is. Timing
+		// each one is the only way to see that from this side.
+		logRTSPCommand(requestLine, responseLine, time.Since(sent), err)
 		if err != nil {
 			return err
 		}
@@ -42,6 +50,28 @@ func proxyRTSP(
 		if err != nil {
 			return err
 		}
+		sent = time.Now()
+	}
+}
+
+// rtspSlowCommand is the deadline an unmodified go2rtc applies to each RTSP
+// command (pkg/rtsp.Timeout). Commands at or past it are the ones a client
+// gives up on, so they are called out rather than merely timed.
+const rtspSlowCommand = 5 * time.Second
+
+func logRTSPCommand(requestLine, responseLine string, took time.Duration, err error) {
+	method := "?"
+	if f := strings.Fields(requestLine); len(f) > 0 {
+		method = strings.ToUpper(f[0])
+	}
+	switch {
+	case err != nil:
+		log.Printf("rtsp timing %s failed after %s: %v", method, took.Round(time.Millisecond), err)
+	case took >= rtspSlowCommand:
+		log.Printf("rtsp timing %s took %s (past the %s an RTSP client allows) -> %s",
+			method, took.Round(time.Millisecond), rtspSlowCommand, responseLine)
+	default:
+		log.Printf("rtsp timing %s took %s -> %s", method, took.Round(time.Millisecond), responseLine)
 	}
 }
 
