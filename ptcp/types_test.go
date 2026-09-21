@@ -243,6 +243,33 @@ func TestSessionLMIDIsAClock(t *testing.T) {
 	}
 }
 
+// The clock has to stay an uptime. Seeding it from the wall clock put the
+// field above 2^31, where a peer storing it signed reads it as negative; the
+// app in the capture carried 24 million and the device 143 million, and a
+// bridge running for a year stays well under both.
+func TestSessionLMIDStaysInTheRangeBothEndpointsUse(t *testing.T) {
+	for _, uptime := range []time.Duration{
+		time.Minute, 7 * 24 * time.Hour, 60 * 24 * time.Hour, 500 * 24 * time.Hour,
+	} {
+		s := newSessionAt(time.Now().Add(-uptime))
+		got := s.Send(NewHeartbeatBody()).Header.LMID
+
+		if got == 0 {
+			t.Errorf("uptime %s: LMID is 0, the value RMID uses for 'nothing received yet'", uptime)
+		}
+		if got >= 1<<31 {
+			t.Errorf("uptime %s: LMID %d is above 2^31 and reads as %d to a peer storing it signed",
+				uptime, got, int32(got))
+		}
+	}
+
+	// Inside the wrap it is still a clock, not a constant.
+	s := newSessionAt(time.Now().Add(-time.Hour))
+	if got, want := s.Send(NewHeartbeatBody()).Header.LMID, uint32(time.Hour.Milliseconds()); got < want {
+		t.Fatalf("LMID %d after an hour of uptime, want at least %d: not tracking uptime", got, want)
+	}
+}
+
 func TestSessionSyncHasFixedPID(t *testing.T) {
 	s := NewSession()
 	p := s.Send(NewSyncBody())

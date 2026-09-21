@@ -129,6 +129,10 @@ DMSS app decides them:
   consecutive packets repeat the previous value. Packets sent inside one tick
   share an LMID, so nothing may treat it as unique or as a sequence number.
   `Stats.OutLagMillis` reads the device's echo of it as a round-trip time.
+  What it carries is an *uptime*: 24 million for the app, 143 million for the
+  device. Seeding it from the wall clock instead puts it above 2^31, which a
+  peer storing it signed reads as negative, and the device then stops consuming
+  anything we send. Ours is process uptime, masked to 31 bits.
 - **PID is a receive-side byte count**, `0xFFFF` minus the bytes taken in since
   our previous transmission. It is not a dedup token: three BINDs for three
   different realms went out 10ms apart carrying `pid=63345` and the device

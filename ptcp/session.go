@@ -74,19 +74,36 @@ func (s *Session) Stats() Stats {
 	}
 }
 
+// processStart anchors the LMID clock. Both endpoints carry an uptime in that
+// field — 24 million for the app in the capture, 143 million for the device —
+// so the clock belongs to the process, not to one session, and a tunnel
+// rebuilt an hour in carries on from where the last one left off.
+var processStart = time.Now()
+
+// lmidBase keeps the clock clear of 0, which is the value RMID carries before
+// anything has been received.
+const lmidBase = 60_000
+
+// lmidMask holds the clock below 2^31, where a peer storing it signed would
+// read it as negative. Seeding it from the wall clock put it there outright;
+// plain uptime gets there too, after 24.8 days. Neither endpoint in the
+// capture emits anything near that — the app carried 24 million and the device
+// 143 million — so the clock wraps at 24.8 days of uptime rather than ever
+// leaving the band they use. RMID deltas are computed as wrapping signed
+// values, so the wrap costs one stale reading, not a stuck one.
+const lmidMask = 0x7FFFFFFF
+
 // NewSession creates a new PTCP session
 func NewSession() *Session {
-	return newSessionAt(time.Now())
+	return newSessionAt(processStart)
 }
 
 func newSessionAt(start time.Time) *Session {
-	s := &Session{epoch: start}
-	// Start the clock somewhere in the middle of its range rather than at 0.
-	// Both endpoints' clocks read as an uptime in the captures, and 0 is the
-	// value RMID carries before anything has been received, so it is the one
-	// reading better not to emit.
-	s.origin = quantizeLMID(uint32(start.UnixMilli()))
-	s.clock = func() uint32 { return s.origin + quantizeLMID(uint32(time.Since(s.epoch)/time.Millisecond)) }
+	s := &Session{epoch: start, origin: lmidBase}
+	s.clock = func() uint32 {
+		ms := uint32(time.Since(s.epoch).Milliseconds() & lmidMask)
+		return (s.origin + quantizeLMID(ms)) & lmidMask
+	}
 	return s
 }
 
