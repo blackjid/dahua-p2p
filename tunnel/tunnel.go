@@ -758,8 +758,14 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 		return nil, ErrTunnelRetired
 	}
 
-	const maxRetries = 3
-	const retryTimeout = 5 * time.Second
+	// The whole budget is spent with an RTSP client already waiting on its
+	// first response, and it holds the caller's negotiate lock throughout, so
+	// every queued stream waits it out too. go2rtc allows five seconds for
+	// that response; measured against a live device a BIND that is answered
+	// at all is answered in 11ms (38ms worst of 16), so a budget past the
+	// client's deadline buys nothing and costs every sibling stream.
+	const maxRetries = 2
+	const retryTimeout = 2 * time.Second
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		realmID := t.randomRealmID()
