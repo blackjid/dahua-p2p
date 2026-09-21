@@ -1,8 +1,10 @@
 package dahua
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/blackjid/dahua-p2p/tunnel"
 )
@@ -63,5 +65,29 @@ func TestSessionKeyIncludesTunnelConfiguration(t *testing.T) {
 		if got := sessionKeyFor(cfg); got == want {
 			t.Fatalf("configuration did not change session key: %+v", cfg)
 		}
+	}
+}
+
+// A stream queued for the negotiate lock has an RTSP client counting against
+// it. Once the tunnel retires, its turn will only bring a refusal, so waiting
+// it out spends the client's whole budget to learn nothing.
+func TestLockNegotiateGivesUpOnRetiredTunnel(t *testing.T) {
+	client := &Client{tunnel: &tunnel.Tunnel{}, negotiateSem: make(chan struct{}, 1)}
+	if err := client.LockNegotiate(context.Background()); err != nil {
+		t.Fatalf("uncontended lock: %v", err)
+	}
+
+	queued := make(chan error, 1)
+	go func() { queued <- client.LockNegotiate(context.Background()) }()
+
+	client.Retire()
+
+	select {
+	case err := <-queued:
+		if !errors.Is(err, ErrTunnelRetired) {
+			t.Fatalf("queued lock = %v, want ErrTunnelRetired", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued caller kept waiting for a tunnel that had retired")
 	}
 }

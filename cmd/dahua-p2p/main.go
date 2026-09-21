@@ -409,6 +409,13 @@ func (b *bridge) openRealm(ctx context.Context, cfg dahua.Config) (net.Conn, fun
 		cancel()
 		if err != nil {
 			b.sessions.Release(b.config.serial, client)
+			logRealmOpen(attempt, realmStart, acquired, time.Now(), time.Now(), time.Now(), err)
+			// The tunnel retired while we queued for it. Another one will
+			// take the realm; waiting here longer will not.
+			if errors.Is(err, dahua.ErrTunnelRetired) {
+				lastErr = err
+				continue
+			}
 			return nil, nil, nil, fmt.Errorf("negotiate lock: %w", err)
 		}
 		locked := time.Now()

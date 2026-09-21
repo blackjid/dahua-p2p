@@ -44,7 +44,14 @@ type Tunnel struct {
 	// already have, so a device that stops granting BINDs does not take
 	// working streams down with it.
 	retired bool
-	done    chan struct{} // closed on shutdown; used by reader and heartbeat
+	// retiredCh is closed once the tunnel stops granting realms, by Retire
+	// or by Close. Callers queued for something it can no longer give them
+	// wait on this rather than on the queue. Created on first use, like
+	// sendPermit, so a zero-value Tunnel behaves like a live one.
+	retiredCh  chan struct{}
+	retiredMu  sync.Mutex
+	retireOnce sync.Once
+	done       chan struct{} // closed on shutdown; used by reader and heartbeat
 
 	// sendPermit serializes outbound packets so that session.Send (which
 	// assigns LMID/PID) and client.Send (UDP write) happen atomically. A
@@ -369,6 +376,7 @@ func (t *Tunnel) Close() error {
 	}
 	t.closed = true
 	close(t.done)
+	t.signalRetired()
 
 	if t.heartbeatTicker != nil {
 		t.heartbeatTicker.Stop()
@@ -423,6 +431,27 @@ func (t *Tunnel) Retire() {
 	t.mu.Lock()
 	t.retired = true
 	t.mu.Unlock()
+	t.signalRetired()
+}
+
+// signalRetired releases everyone waiting for something this tunnel will
+// never grant. Safe to call repeatedly and from both Retire and Close.
+func (t *Tunnel) signalRetired() {
+	ch := t.retiredChan()
+	t.retireOnce.Do(func() { close(ch) })
+}
+
+// Retired returns a channel closed when the tunnel stops granting new realms,
+// so a caller can abandon a queue instead of waiting out its turn for one.
+func (t *Tunnel) Retired() <-chan struct{} { return t.retiredChan() }
+
+func (t *Tunnel) retiredChan() chan struct{} {
+	t.retiredMu.Lock()
+	defer t.retiredMu.Unlock()
+	if t.retiredCh == nil {
+		t.retiredCh = make(chan struct{})
+	}
+	return t.retiredCh
 }
 
 // IsRetired reports whether the tunnel has stopped accepting new realms.

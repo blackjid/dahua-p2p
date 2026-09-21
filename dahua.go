@@ -108,11 +108,21 @@ func ConnectWithConfig(cfg Config) (*Client, error) {
 	}, nil
 }
 
-// LockNegotiate blocks until the negotiate lock is acquired, or ctx is done.
+// LockNegotiate blocks until the negotiate lock is acquired, or ctx is done,
+// or the tunnel stops granting realms, which returns ErrTunnelRetired.
+//
+// Queueing for a tunnel that can no longer serve you is the most expensive
+// way to fail. Measured on a burst of eight streams: one dial timed out and
+// retired the tunnel, and six streams then spent between 4.3s and 6.8s
+// waiting their turn on its lock, only to be refused the moment they got it.
+// Most of them were past the five seconds their client allows before the
+// BIND that was never going to be sent.
 func (c *Client) LockNegotiate(ctx context.Context) error {
 	select {
 	case c.negotiateSem <- struct{}{}:
 		return nil
+	case <-c.tunnel.Retired():
+		return ErrTunnelRetired
 	case <-ctx.Done():
 		return ctx.Err()
 	}
