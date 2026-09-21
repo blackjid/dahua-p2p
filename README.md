@@ -49,10 +49,18 @@ streams:
 ```
 
 Run one bridge per Dahua device or NVR. Different channels and subtypes can
-share that bridge and its P2P tunnel. The bridge establishes and pins the P2P
-tunnel before it opens the RTSP listener, so the first RTSP client does not pay
-the cloud handshake cost. If the initial handshake fails, the process exits so
-the container runtime can restart it.
+share that bridge and its P2P tunnel. The bridge establishes the P2P tunnel
+before it opens the RTSP listener, so the first RTSP client does not pay the
+cloud handshake cost. If the initial handshake fails, the process exits so the
+container runtime can restart it.
+
+It then keeps two tunnel reservations in hand and refills each one as a stream
+takes it. A reservation on a tunnel that still has room costs nothing; the one
+that finds every tunnel full pays the cloud handshake, and holding them in
+advance moves that cost into the background. An RTSP client applies its own
+deadline to its first response -- five seconds in go2rtc -- and everything the
+bridge does to open a realm comes out of that budget before a byte reaches the
+device.
 
 | Environment | Flag | Default | Purpose |
 |---|---|---:|---|
@@ -135,19 +143,27 @@ datagram (24 + 12 + 1280) inside common MTUs.
 
 Inbound headers carry the device's view of the conversation, so loss is
 observable without a capture. `Tunnel.Stats` exposes it and the tunnel traces
-it every 30s while realms are active:
+it every 30s, idle tunnels included:
 
 ```
 ptcp counters sent=23314 peer_recv=23302 out_unacked=12 out_msgs=179
-              recv=124174150 peer_sent=124172858 in_skew=-1292 realms=7
+              recv=124174150 peer_sent=124172858 in_skew=-1292 missed_hb=0 realms=7
 ```
 
-`out_unacked` returns to 0 in a healthy tunnel; sustained growth means the
-device has stopped consuming what we send. That is the failure that precedes
-a tunnel refusing every BIND, and it is invisible to inbound liveness checks
-because the device keeps sending packets of its own throughout. The heartbeat
-loop watches the same signal and rebuilds the tunnel after
-`outboundStallTimeout`. `in_skew` is normally slightly *negative* — the device's snapshot
+`out_unacked` returns to 0 in a healthy tunnel; sustained growth while realms
+are writing means the device has stopped consuming what we send. That is the
+failure that precedes a tunnel refusing every BIND, and it is invisible to
+inbound liveness checks because the device keeps sending packets of its own
+throughout. The heartbeat loop watches the same signal and rebuilds the tunnel
+after `outboundStallTimeout`.
+
+The device only reports its `Recv` in packets it sends, so over a tunnel
+nobody is writing to there is no fresh number to read and `peer_recv` simply
+stops moving. That is not a stall, and treating it as one tore down tunnels
+that were serving live realms, so the check also requires that a realm has
+written something since the counter last moved. A tunnel that has gone
+entirely silent is caught by `missed_hb` instead, which allows six times as
+long. `in_skew` is normally slightly *negative* — the device's snapshot
 predates packets we already consumed — and sustained growth is inbound loss.
 `out_msgs` settles at a steady non-zero lag because the device advances `RMID`
 more slowly than we emit coalesced ACKs.
