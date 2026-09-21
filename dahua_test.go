@@ -91,3 +91,31 @@ func TestLockNegotiateGivesUpOnRetiredTunnel(t *testing.T) {
 		t.Fatal("queued caller kept waiting for a tunnel that had retired")
 	}
 }
+
+// A reserve tunnel is only worth holding if it is a tunnel of its own. Room
+// left on a live tunnel is not a reserve: it disappears the moment that
+// tunnel goes deaf to BINDs. The fixed port makes the test observable without
+// a handshake, because a second tunnel cannot bind it.
+func TestAcquireFreshIgnoresRoomOnLiveTunnels(t *testing.T) {
+	cfg := Config{Serial: "device", P2PPort: 5000, MaxRealms: 4}
+	key := sessionKeyFor(cfg)
+	client := &Client{tunnel: &tunnel.Tunnel{}}
+	manager := NewSessionManager()
+	manager.sessions[key] = []*managedSession{{client: client, maxRealms: 4}}
+
+	if got, err := manager.Acquire(cfg); err != nil || got != client {
+		t.Fatalf("Acquire with room to spare = %v, %v; want the live tunnel", got, err)
+	}
+	if _, err := manager.AcquireFresh(cfg); !errors.Is(err, ErrFixedPortCapacity) {
+		t.Fatalf("AcquireFresh = %v, want ErrFixedPortCapacity rather than the live tunnel", err)
+	}
+}
+
+func TestClosedSessionManagerRejectsAcquireFresh(t *testing.T) {
+	manager := NewSessionManager()
+	manager.CloseAll()
+
+	if _, err := manager.AcquireFresh(Config{}); !errors.Is(err, ErrSessionManagerClosed) {
+		t.Fatalf("AcquireFresh after CloseAll = %v, want ErrSessionManagerClosed", err)
+	}
+}

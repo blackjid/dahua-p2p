@@ -51,13 +51,25 @@ streams:
 Run one bridge per Dahua device or NVR. Different channels and subtypes can
 share that bridge and its P2P tunnel. The bridge establishes the P2P tunnel
 before it opens the RTSP listener, so the first RTSP client does not pay the
-cloud handshake cost. If the initial handshake fails, the process exits so the
-container runtime can restart it.
+cloud handshake cost. That handshake is retried a few times -- against this
+device it fails perhaps two times in three, always as a read timeout part way
+through -- and the process exits only if every attempt fails, so the container
+runtime can restart it.
 
 It then keeps two tunnel reservations in hand and refills each one as a stream
 takes it. A reservation on a tunnel that still has room costs nothing; the one
 that finds every tunnel full pays the cloud handshake, and holding them in
-advance moves that cost into the background. An RTSP client applies its own
+advance moves that cost into the background.
+
+Alongside those reservations the bridge keeps one *idle tunnel* in reserve,
+handshaked ahead of time and carrying no streams. Room on a live tunnel is not
+a substitute: a tunnel can stop granting realms while the streams it already
+carries run on undisturbed, and at that moment every reservation on it is
+worthless and the replacement handshake has not started. An idle tunnel is not
+reaped by the device and answers a BIND in about 20ms, so the handover costs
+nothing. As soon as a stream takes the reserve, the next one is handshaked.
+
+An RTSP client applies its own
 deadline to its first response -- five seconds in go2rtc -- and everything the
 bridge does to open a realm comes out of that budget before a byte reaches the
 device.

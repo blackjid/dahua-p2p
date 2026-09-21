@@ -238,6 +238,11 @@ func (b *bridge) prewarm(ctx context.Context) error {
 		if client, err = b.sessions.Acquire(b.clientConfig()); err == nil {
 			b.spare <- client
 			go b.warmTunnels(ctx)
+			// One fixed local UDP port can carry one tunnel, so there is no
+			// second one to keep in reserve.
+			if b.config.p2pPort == 0 {
+				go b.warmReserve(ctx)
+			}
 			log.Printf("Dahua P2P tunnel ready for serial %s", b.config.serial)
 			return nil
 		}
@@ -290,6 +295,74 @@ func (b *bridge) warmTunnels(ctx context.Context) {
 		case <-ctx.Done():
 			b.sessions.Release(b.config.serial, client)
 			return
+		}
+	}
+}
+
+// reserveCheck is how often the warmer looks at the tunnel it is holding in
+// reserve. It is a poll because what ends the hold is a stream arriving on
+// that tunnel, which nothing reports.
+const reserveCheck = time.Second
+
+// warmReserve keeps one idle tunnel in hand beyond the ones carrying streams.
+//
+// A reservation on a tunnel that is already serving streams is free, but it
+// buys nothing when that tunnel goes deaf to BINDs: the reservation is
+// dropped and the handshake for the replacement starts there and then, with
+// an RTSP client waiting on it. Over five hours that cost 63% of the
+// handovers between 15 and 60 seconds, against a handshake that succeeds
+// about one time in three and so often needs several. An idle tunnel, by
+// contrast, is not reaped by the device and answers a BIND in about 20ms, so
+// the replacement is ready before it is needed.
+//
+// The hold ends when the tunnel stops being a reserve: a stream took it
+// (which is the normal case, once the live tunnel is deaf or full), it went
+// deaf itself, or it died. The next one is handshaked immediately.
+func (b *bridge) warmReserve(ctx context.Context) {
+	const maxBackoff = 15 * time.Second
+	backoff := time.Second
+	for {
+		client, err := b.sessions.AcquireFresh(b.clientConfig())
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, dahua.ErrSessionManagerClosed) {
+				return
+			}
+			log.Printf("reserve tunnel: %v", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff *= 2; backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		backoff = time.Second
+
+		spent := b.holdReserve(ctx, client)
+		// Releasing only gives up this reservation. A stream that took the
+		// tunnel holds its own, and keeps it alive.
+		b.sessions.Release(b.config.serial, client)
+		if !spent {
+			return
+		}
+	}
+}
+
+// holdReserve blocks until the given tunnel is no longer a reserve, reporting
+// true. It reports false when the bridge is shutting down.
+func (b *bridge) holdReserve(ctx context.Context, client *dahua.Client) bool {
+	ticker := time.NewTicker(reserveCheck)
+	defer ticker.Stop()
+	for {
+		if client.IsClosed() || client.IsRetired() || client.ActiveRealms() > 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
 		}
 	}
 }

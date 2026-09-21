@@ -326,6 +326,21 @@ func (m *SessionManager) findAvailableSession(key sessionKey) *managedSession {
 // config pins one local UDP port, which cannot be bound by two live tunnels.
 // The caller must call Release when done.
 func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
+	return m.acquire(cfg, true)
+}
+
+// AcquireFresh handshakes a tunnel of its own, ignoring the room left on the
+// live ones. It is how a caller keeps a tunnel in reserve: a reservation on a
+// tunnel that is already carrying streams is worth nothing the moment that
+// tunnel goes deaf to BINDs, which is exactly when a replacement is needed
+// and far too late to start handshaking one.
+//
+// The caller must call Release when done.
+func (m *SessionManager) AcquireFresh(cfg Config) (*Client, error) {
+	return m.acquire(cfg, false)
+}
+
+func (m *SessionManager) acquire(cfg Config, reuse bool) (*Client, error) {
 	key := sessionKeyFor(cfg)
 
 	for {
@@ -334,14 +349,16 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 			m.mu.Unlock()
 			return nil, ErrSessionManagerClosed
 		}
-		if s := m.findAvailableSession(key); s != nil {
-			if s.idleTimer != nil {
-				s.idleTimer.Stop()
-				s.idleTimer = nil
+		if reuse {
+			if s := m.findAvailableSession(key); s != nil {
+				if s.idleTimer != nil {
+					s.idleTimer.Stop()
+					s.idleTimer = nil
+				}
+				s.refCount++
+				m.mu.Unlock()
+				return s.client, nil
 			}
-			s.refCount++
-			m.mu.Unlock()
-			return s.client, nil
 		}
 		if key.p2pPort != 0 && len(m.sessions[key]) != 0 {
 			m.mu.Unlock()
@@ -349,11 +366,14 @@ func (m *SessionManager) Acquire(cfg Config) (*Client, error) {
 		}
 
 		// Another goroutine is already handshaking for this configuration.
-		// Wait, then retry capacity selection under the lock.
+		// Wait, then retry capacity selection under the lock. Two handshakes
+		// at once against this device's cloud is how a burst of waiting
+		// streams turns into a burst of timeouts, so a caller that wants its
+		// own tunnel waits for that one to land before starting its own.
 		if inf, ok := m.inflight[key]; ok {
 			m.mu.Unlock()
 			<-inf.done
-			if inf.err != nil {
+			if reuse && inf.err != nil {
 				return nil, inf.err
 			}
 			continue
