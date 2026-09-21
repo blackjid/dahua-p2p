@@ -119,3 +119,48 @@ func TestClosedSessionManagerRejectsAcquireFresh(t *testing.T) {
 		t.Fatalf("AcquireFresh after CloseAll = %v, want ErrSessionManagerClosed", err)
 	}
 }
+
+func TestSettleIsPacedPerDeviceNotPerTunnel(t *testing.T) {
+	const serial = "paced-device"
+	negotiateClocks.Delete(serial)
+
+	settle := 40 * time.Millisecond
+	first := &Client{serial: serial, settle: settle}
+	second := &Client{serial: serial, settle: settle}
+
+	// A different tunnel to the same device must queue behind the first
+	// one's negotiation: the device stalls on realm setup rate, and it
+	// stalls device-wide.
+	first.DoneNegotiate()
+
+	start := time.Now()
+	second.WaitSettle()
+
+	if waited := time.Since(start); waited < settle/2 {
+		t.Fatalf("second tunnel waited %v, want at least %v", waited, settle/2)
+	}
+}
+
+func TestSettleDoesNotDelayTheFirstNegotiation(t *testing.T) {
+	const serial = "fresh-device"
+	negotiateClocks.Delete(serial)
+
+	client := &Client{serial: serial, settle: time.Second}
+
+	start := time.Now()
+	client.WaitSettle()
+
+	if waited := time.Since(start); waited > 100*time.Millisecond {
+		t.Fatalf("first negotiation waited %v, want no wait", waited)
+	}
+}
+
+func TestSettleIntervalIsConfigurable(t *testing.T) {
+	cfg := Config{Serial: "device", NegotiateSettle: 3 * time.Second}
+	if got := settleFor(cfg); got != 3*time.Second {
+		t.Fatalf("settleFor(%v) = %v, want 3s", cfg.NegotiateSettle, got)
+	}
+	if got := settleFor(Config{Serial: "device"}); got != NegotiateSettle {
+		t.Fatalf("settleFor(0) = %v, want the default %v", got, NegotiateSettle)
+	}
+}

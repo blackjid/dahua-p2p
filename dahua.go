@@ -31,15 +31,26 @@ var ErrSessionManagerClosed = errors.New("dahua session manager closed")
 // full. A second tunnel cannot bind the same local port concurrently.
 var ErrFixedPortCapacity = errors.New("fixed P2P port tunnel is at capacity")
 
-// Settle times between consecutive RTSP negotiations on one tunnel. The
-// device needs a breather after a DESCRIBE before it will answer the next
-// BIND reliably. minNegotiateSettle is used when the device is still
-// answering heartbeats, which indicates it is not yet saturated.
-const (
-	NegotiateSettle    = 500 * time.Millisecond
-	minNegotiateSettle = 250 * time.Millisecond
-	deadTunnelSilence  = 12 * time.Second
-)
+// NegotiateSettle is the default interval between consecutive RTSP
+// negotiations against one device. The device needs a breather after a
+// DESCRIBE before it will answer the next BIND reliably.
+//
+// The interval is per *device*, not per tunnel: a device that has stopped
+// answering BINDs stops answering them on every tunnel at once, and stops
+// answering P2P handshakes with them, so two tunnels pacing independently
+// simply arrive at the same wall twice as fast. Config.NegotiateSettle
+// overrides it, because the rate a given firmware tolerates is not something
+// this package can know.
+//
+// There was formerly a shorter interval used while the tunnel was still
+// answering heartbeats, on the theory that a responsive device is not
+// saturated. It is the reverse: responsiveness is the normal state right up
+// until a burst of realm setups ends it, so the shortcut only ever fired
+// while many streams were coming up at once — the one condition under which
+// the device cannot take them.
+const NegotiateSettle = 500 * time.Millisecond
+
+const deadTunnelSilence = 12 * time.Second
 
 // DefaultIdleTimeout is how long a tunnel persists after all streams
 // disconnect. Re-handshaking costs ~3s, so keeping the tunnel warm across a
@@ -60,10 +71,11 @@ const DefaultMaxRealmsPerTunnel = 8
 // a 1-buffer channel as a context-cancellable semaphore so a caller can give
 // up rather than wedge forever behind a stuck negotiation.
 type Client struct {
-	tunnel        *tunnel.Tunnel
-	negotiateSem  chan struct{} // buffered 1; holds a token while locked
-	lastNegotiate time.Time     // guarded by the negotiate lock
-	errorf        func(format string, v ...any)
+	tunnel       *tunnel.Tunnel
+	negotiateSem chan struct{} // buffered 1; holds a token while locked
+	serial       string        // which device's negotiation clock to pace against
+	settle       time.Duration
+	errorf       func(format string, v ...any)
 }
 
 // Config contains configuration options for the P2P client
@@ -74,6 +86,11 @@ type Config struct {
 	Timeout   time.Duration
 	P2PPort   int // Fixed local UDP port for P2P (0 = random)
 	MaxRealms int // Max concurrent realms per tunnel (0 = DefaultMaxRealmsPerTunnel)
+
+	// NegotiateSettle is the interval held between RTSP negotiations against
+	// this device (0 = NegotiateSettle). It paces realm setup, which is the
+	// rate the device stalls on.
+	NegotiateSettle time.Duration
 
 	// Trace and Error report protocol activity. This package owns no logger,
 	// so the caller wires them to one; while nil, nothing is formatted.
@@ -103,6 +120,8 @@ func ConnectWithConfig(cfg Config) (*Client, error) {
 	return &Client{
 		tunnel:       t,
 		negotiateSem: make(chan struct{}, 1),
+		serial:       cfg.Serial,
+		settle:       settleFor(cfg),
 		errorf:       cfg.Error,
 	}, nil
 }
@@ -134,19 +153,52 @@ func (c *Client) UnlockNegotiate() {
 	<-c.negotiateSem
 }
 
+// settleFor resolves the configured pacing interval, falling back to the
+// package default.
+func settleFor(cfg Config) time.Duration {
+	if cfg.NegotiateSettle > 0 {
+		return cfg.NegotiateSettle
+	}
+	return NegotiateSettle
+}
+
+// negotiateClocks holds the last negotiation time per device serial. Realm
+// setup is paced against the device rather than the tunnel, so every client
+// talking to one NVR queues behind the same clock.
+var negotiateClocks sync.Map // serial -> *negotiateClock
+
+type negotiateClock struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+func clockFor(serial string) *negotiateClock {
+	if c, ok := negotiateClocks.Load(serial); ok {
+		return c.(*negotiateClock)
+	}
+	c, _ := negotiateClocks.LoadOrStore(serial, &negotiateClock{})
+	return c.(*negotiateClock)
+}
+
 // WaitSettle sleeps until the device is ready for a new RTSP negotiation.
 // Must be called while holding the negotiate lock.
+//
+// The wait is taken against the device's clock, so streams spread across
+// several tunnels still set up realms one settle interval apart. Holding the
+// negotiate lock across the sleep is what makes that a queue rather than a
+// thundering herd: callers arrive together, and leave one interval apart.
 func (c *Client) WaitSettle() {
-	if c.lastNegotiate.IsZero() {
+	clock := clockFor(c.serial)
+
+	clock.mu.Lock()
+	last := clock.last
+	clock.mu.Unlock()
+
+	if last.IsZero() {
 		return
 	}
 
-	settle := NegotiateSettle
-	if c.tunnel.IsResponsive(2 * time.Second) {
-		settle = minNegotiateSettle
-	}
-
-	if wait := settle - time.Since(c.lastNegotiate); wait > 0 {
+	if wait := c.settle - time.Since(last); wait > 0 {
 		time.Sleep(wait)
 	}
 }
@@ -154,7 +206,10 @@ func (c *Client) WaitSettle() {
 // DoneNegotiate records the end of an RTSP negotiation.
 // Must be called while holding the negotiate lock.
 func (c *Client) DoneNegotiate() {
-	c.lastNegotiate = time.Now()
+	clock := clockFor(c.serial)
+	clock.mu.Lock()
+	clock.last = time.Now()
+	clock.mu.Unlock()
 }
 
 // SetOnClose registers a callback invoked once when the underlying tunnel
