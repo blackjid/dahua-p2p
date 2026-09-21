@@ -39,7 +39,6 @@ const (
 	NegotiateSettle    = 500 * time.Millisecond
 	minNegotiateSettle = 250 * time.Millisecond
 	deadTunnelSilence  = 12 * time.Second
-	maxBindFailures    = 1
 )
 
 // DefaultIdleTimeout is how long a tunnel persists after all streams
@@ -188,12 +187,6 @@ func (c *Client) Retire() { c.tunnel.Retire() }
 // IsRetired reports whether the client has stopped accepting new realms.
 func (c *Client) IsRetired() bool { return c.tunnel.IsRetired() }
 
-// BindFailures returns how many consecutive realm dials have timed out on the
-// underlying tunnel. Reset to zero by any successful dial.
-func (c *Client) BindFailures() int {
-	return c.tunnel.BindFailures()
-}
-
 // ActiveRealms returns the number of active realms on the underlying tunnel.
 func (c *Client) ActiveRealms() int {
 	return c.tunnel.ActiveRealms()
@@ -220,15 +213,13 @@ func (c *Client) Dial(port uint32) (net.Conn, error) {
 		return conn, err
 	}
 
-	switch {
-	case !c.tunnel.IsResponsive(deadTunnelSilence):
+	if !c.tunnel.IsResponsive(deadTunnelSilence) {
 		c.reportError("device silent, closing tunnel")
 		_ = c.Close()
-	case c.tunnel.BindFailures() >= maxBindFailures:
-		c.reportError("tunnel not granting realms, retiring (bind_failures=%d realms=%d)",
-			c.tunnel.BindFailures(), c.tunnel.ActiveRealms())
-		c.tunnel.Retire()
+		return nil, err
 	}
+	c.reportError("tunnel not granting realms, retiring (realms=%d)", c.tunnel.ActiveRealms())
+	c.tunnel.Retire()
 	return nil, err
 }
 

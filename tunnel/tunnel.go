@@ -74,12 +74,6 @@ type Tunnel struct {
 	connChMu sync.Mutex
 	dialMu   sync.Mutex // serializes Dial calls so BINDs don't overlap
 
-	// bindFailures counts consecutive Dial calls that exhausted their BIND
-	// retries. Guarded by dialMu, which serializes every Dial. A device can
-	// keep answering heartbeats while refusing to grant any new realm, so
-	// liveness alone is not proof the tunnel is still usable.
-	bindFailures int
-
 	// Heartbeat
 	heartbeatTicker *time.Ticker
 
@@ -775,14 +769,6 @@ func (t *Tunnel) randomRealmID() uint32 {
 	}
 }
 
-// BindFailures returns how many consecutive Dial calls have exhausted their
-// BIND retries. Reset to zero by any successful Dial.
-func (t *Tunnel) BindFailures() int {
-	t.dialMu.Lock()
-	defer t.dialMu.Unlock()
-	return t.bindFailures
-}
-
 // ActiveRealms returns the number of currently active realms on this tunnel.
 func (t *Tunnel) ActiveRealms() int {
 	t.realmsMu.RLock()
@@ -793,7 +779,6 @@ func (t *Tunnel) ActiveRealms() int {
 
 // Dial creates a new realm/connection to the specified port on the device.
 // Serialized via dialMu so the device processes one BIND at a time.
-// Retries the bind request up to 3 times since UDP packets can be lost.
 func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 	t.mu.RLock()
 	closed, retired := t.closed, t.retired
@@ -821,76 +806,77 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 		return nil, ErrTunnelRetired
 	}
 
+	// One BIND, and two seconds for it.
+	//
 	// A BIND the device means to answer comes back in tens of milliseconds:
-	// 11ms median and 40ms worst over 16 measured realm opens. One still
-	// unanswered after two seconds was dropped, and only a fresh realm ID
-	// will do. The whole budget matters because Dial runs while an RTSP
-	// client is already waiting on its first response, under a deadline it
-	// sets itself -- five seconds in go2rtc -- so 3x5s spent here loses the
-	// stream even when the retry eventually works.
-	const maxRetries = 2
-	const retryTimeout = 2 * time.Second
+	// 11ms median and 40ms worst over 16 measured realm opens. This used to
+	// retry up to three times with a fresh realm ID, on the theory that UDP
+	// loses packets. Across three production logs, twenty such retries went
+	// out and not one was ever answered: once a tunnel stops granting
+	// realms, it grants no more, while a sibling tunnel to the same device
+	// binds one in under a second. Retrying here only spends the waiting
+	// RTSP client's budget -- five seconds in go2rtc, for the whole of
+	// acquire, lock, settle and BIND -- and holds the negotiate lock while
+	// every other stream on the tunnel queues behind it.
+	//
+	// Failing at two seconds lets the caller do the thing that does work,
+	// which is to take the realm to another tunnel.
+	const bindTimeout = 2 * time.Second
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		realmID := t.randomRealmID()
-		conn := &Conn{
-			tunnel:               t,
-			realmID:              realmID,
-			remotePort:           port,
-			dataCh:               make(chan []byte, 4096),
-			closeCh:              make(chan struct{}),
-			readDeadlineChanged:  make(chan struct{}),
-			writeDeadlineChanged: make(chan struct{}),
-		}
-		connCh := make(chan bool, 1)
+	realmID := t.randomRealmID()
+	conn := &Conn{
+		tunnel:               t,
+		realmID:              realmID,
+		remotePort:           port,
+		dataCh:               make(chan []byte, 4096),
+		closeCh:              make(chan struct{}),
+		readDeadlineChanged:  make(chan struct{}),
+		writeDeadlineChanged: make(chan struct{}),
+	}
+	connCh := make(chan bool, 1)
 
-		// Install conn under realmsMu, refusing if the tunnel closed between
-		// our initial check and now (which would have nilled the map).
-		t.realmsMu.Lock()
-		if t.realms == nil {
-			t.realmsMu.Unlock()
-			return nil, ErrTunnelClosed
-		}
-		t.realms[realmID] = conn
+	// Install conn under realmsMu, refusing if the tunnel closed between
+	// our initial check and now (which would have nilled the map).
+	t.realmsMu.Lock()
+	if t.realms == nil {
 		t.realmsMu.Unlock()
+		return nil, ErrTunnelClosed
+	}
+	t.realms[realmID] = conn
+	t.realmsMu.Unlock()
 
+	t.connChMu.Lock()
+	t.connCh[realmID] = connCh
+	t.connChMu.Unlock()
+
+	cleanup := func() {
+		t.realmsMu.Lock()
+		delete(t.realms, realmID)
+		t.realmsMu.Unlock()
 		t.connChMu.Lock()
-		t.connCh[realmID] = connCh
+		delete(t.connCh, realmID)
 		t.connChMu.Unlock()
-
-		cleanup := func() {
-			t.realmsMu.Lock()
-			delete(t.realms, realmID)
-			t.realmsMu.Unlock()
-			t.connChMu.Lock()
-			delete(t.connCh, realmID)
-			t.connChMu.Unlock()
-		}
-
-		t.trace("sending BIND attempt=%d realm=%d port=%d", attempt+1, realmID, port)
-
-		if err := t.sendPacket(ptcp.NewBindBody(realmID, port)); err != nil {
-			cleanup()
-			return nil, err
-		}
-
-		select {
-		case <-connCh:
-			t.bindFailures = 0
-			return conn, nil
-		case <-t.done:
-			cleanup()
-			return nil, ErrTunnelClosed
-		case <-time.After(retryTimeout):
-			cleanup()
-			t.trace("bind retry with fresh realm ID attempt=%d port=%d realm=%d", attempt+1, port, realmID)
-			continue
-		}
 	}
 
-	t.bindFailures++
-	t.errorf("bind request timed out after all retries port=%d failures=%d closed=%v",
-		port, t.bindFailures, t.IsClosed())
+	t.trace("sending BIND realm=%d port=%d", realmID, port)
+
+	if err := t.sendPacket(ptcp.NewBindBody(realmID, port)); err != nil {
+		cleanup()
+		return nil, err
+	}
+
+	select {
+	case <-connCh:
+		return conn, nil
+	case <-t.done:
+		cleanup()
+		return nil, ErrTunnelClosed
+	case <-time.After(bindTimeout):
+		cleanup()
+	}
+
+	t.errorf("bind request unanswered after %s port=%d closed=%v",
+		bindTimeout, port, t.IsClosed())
 	return nil, ErrDialTimeout
 }
 

@@ -1,58 +1,8 @@
 package tunnel
 
 import (
-	"sync"
 	"testing"
 )
-
-// The device can acknowledge every byte we send while refusing to grant any
-// new realm. Liveness alone therefore cannot decide whether a tunnel is still
-// usable, so Dial tracks consecutive BIND exhaustion and callers rebuild on
-// it. These tests pin the counter's contract.
-
-func TestBindFailuresStartsZero(t *testing.T) {
-	tn := &Tunnel{}
-	if got := tn.BindFailures(); got != 0 {
-		t.Fatalf("BindFailures on a fresh tunnel = %d, want 0", got)
-	}
-}
-
-func TestBindFailuresResetBySuccess(t *testing.T) {
-	tn := &Tunnel{}
-
-	// Two exhausted dials put the tunnel over the rebuild threshold.
-	tn.dialMu.Lock()
-	tn.bindFailures = 2
-	tn.dialMu.Unlock()
-
-	if got := tn.BindFailures(); got != 2 {
-		t.Fatalf("BindFailures = %d, want 2", got)
-	}
-
-	// A granted realm means the device is serving BINDs again.
-	tn.dialMu.Lock()
-	tn.bindFailures = 0
-	tn.dialMu.Unlock()
-
-	if got := tn.BindFailures(); got != 0 {
-		t.Fatalf("BindFailures after a successful dial = %d, want 0", got)
-	}
-}
-
-// BindFailures takes dialMu, the same lock Dial holds for its whole run, so a
-// caller reading it from another goroutine must not race or deadlock.
-func TestBindFailuresConcurrentReads(t *testing.T) {
-	tn := &Tunnel{}
-	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = tn.BindFailures()
-		}()
-	}
-	wg.Wait()
-}
 
 // Retiring is the middle ground between healthy and closed: the device will
 // not grant new realms, but the ones it already granted are still streaming,
