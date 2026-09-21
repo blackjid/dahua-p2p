@@ -12,9 +12,11 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +26,18 @@ import (
 const (
 	initialRequestTimeout = 10 * time.Second
 	negotiateTimeout      = 90 * time.Second
+
+	// admitTimeout bounds how long a client waits behind other streams for
+	// the negotiate lock. RTSP clients abandon a command in about five
+	// seconds and go2rtc hardcodes exactly that, so a longer queue only
+	// collects connections whose client has already given up while they
+	// still hold a slot. Failing fast lets the client retry against a
+	// bridge that can actually answer it.
+	admitTimeout = 3 * time.Second
+
+	// logInterval is the minimum gap between repeats of a throttled line.
+	logInterval = 5 * time.Second
+
 	reconnectMinDelay     = time.Second
 	reconnectMaxDelay     = 30 * time.Second
 	defaultMaxConnections = 32
@@ -38,7 +52,12 @@ type config struct {
 	maxRealms int
 	maxConns  int
 	timeout   time.Duration
-	debug     bool
+
+	bindRetries  int
+	bindTimeout  time.Duration
+	countersEach time.Duration
+
+	debug bool
 }
 
 type bridge struct {
@@ -47,8 +66,65 @@ type bridge struct {
 	cancel      context.CancelFunc
 	slots       chan struct{}
 	connections map[net.Conn]struct{}
+	served      atomic.Bool
+	refusals    tally
 	mu          sync.Mutex
 	wg          sync.WaitGroup
+}
+
+// tally counts refusals by reason and reports them as one line per
+// reportInterval. A client that retries a refused stream several times a
+// second would otherwise bury every line worth reading; dropping the repeats
+// outright would instead hide which reason was actually dominant.
+type tally struct {
+	mu     sync.Mutex
+	last   time.Time
+	counts map[string]int
+}
+
+// add records one refusal and returns the counts to report, or nil while the
+// reporting interval has not elapsed. The returned map is the caller's.
+func (t *tally) add(reason string, interval time.Duration) map[string]int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.counts == nil {
+		t.counts = map[string]int{}
+	}
+	t.counts[reason]++
+	if !t.last.IsZero() && time.Since(t.last) < interval {
+		return nil
+	}
+	t.last = time.Now()
+	counts := t.counts
+	t.counts = nil
+	return counts
+}
+
+// report logs the reasons RTSP connections were turned away since the last
+// report, busiest first.
+func (t *tally) report(reason string) {
+	counts := t.add(reason, logInterval)
+	if counts == nil {
+		return
+	}
+	reasons := make([]string, 0, len(counts))
+	for r := range counts {
+		reasons = append(reasons, r)
+	}
+	sort.Slice(reasons, func(i, j int) bool {
+		if counts[reasons[i]] != counts[reasons[j]] {
+			return counts[reasons[i]] > counts[reasons[j]]
+		}
+		return reasons[i] < reasons[j]
+	})
+
+	total := 0
+	parts := make([]string, 0, len(reasons))
+	for _, r := range reasons {
+		total += counts[r]
+		parts = append(parts, fmt.Sprintf("%s=%d", r, counts[r]))
+	}
+	log.Printf("turned away %d RTSP connections: %s", total, strings.Join(parts, " "))
 }
 
 func main() {
@@ -77,7 +153,7 @@ func runBridge(ctx context.Context, cfg config) error {
 	b := &bridge{
 		config:      cfg,
 		cancel:      cancel,
-		slots:       make(chan struct{}, connectionLimit(cfg)),
+		slots:       make(chan struct{}, cfg.maxConns),
 		connections: make(map[net.Conn]struct{}),
 	}
 
@@ -94,7 +170,16 @@ func runBridge(ctx context.Context, cfg config) error {
 	defer closeListener(listener)
 
 	log.Printf("Dahua P2P bridge listening on %s for serial %s", listener.Addr(), cfg.serial)
-	return b.serve(ctx, listener)
+	if err := b.serve(ctx, listener); err != nil {
+		return err
+	}
+	// A tunnel that never granted a realm is a failed attempt, not a healthy
+	// session that ended. Saying so lets the supervisor back off instead of
+	// rebuilding a tunnel the device is refusing once a second.
+	if !b.served.Load() {
+		return errors.New("tunnel closed without serving any RTSP stream")
+	}
+	return nil
 }
 
 func supervise(ctx context.Context, minDelay, maxDelay time.Duration, runCycle func(context.Context) error) error {
@@ -134,13 +219,6 @@ func nextBackoff(delay, maxDelay time.Duration) time.Duration {
 	return delay * 2
 }
 
-func connectionLimit(cfg config) int {
-	if cfg.maxConns < cfg.maxRealms {
-		return cfg.maxConns
-	}
-	return cfg.maxRealms
-}
-
 func loadConfig() (config, error) {
 	p2pPort, err := envInt("DAHUA_P2P_PORT", 0)
 	if err != nil {
@@ -154,6 +232,18 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	bindRetries, err := envInt("DAHUA_BIND_RETRIES", 0)
+	if err != nil {
+		return config{}, err
+	}
+	bindTimeout, err := envDuration("DAHUA_BIND_TIMEOUT", 0)
+	if err != nil {
+		return config{}, err
+	}
+	countersEach, err := envDuration("DAHUA_COUNTERS_INTERVAL", 0)
+	if err != nil {
+		return config{}, err
+	}
 
 	cfg := config{}
 	flag.StringVar(&cfg.listen, "listen", env("LISTEN_ADDR", ":8554"), "TCP address to expose as RTSP")
@@ -163,6 +253,9 @@ func loadConfig() (config, error) {
 	flag.IntVar(&cfg.maxRealms, "max-realms", maxRealms, "maximum concurrent RTSP connections per P2P tunnel")
 	flag.IntVar(&cfg.maxConns, "max-connections", maxConns, "maximum concurrent RTSP client connections")
 	flag.DurationVar(&cfg.timeout, "timeout", 10*time.Second, "P2P handshake timeout")
+	flag.DurationVar(&cfg.countersEach, "counters-interval", countersEach, "how often to trace PTCP counters; needs -debug")
+	flag.IntVar(&cfg.bindRetries, "bind-retries", bindRetries, "attempts to open one P2P realm before giving up")
+	flag.DurationVar(&cfg.bindTimeout, "bind-timeout", bindTimeout, "how long to wait for each realm attempt")
 	flag.BoolVar(&cfg.debug, "debug", false, "log protocol traces")
 	flag.Parse()
 	if cfg.serial == "" {
@@ -187,6 +280,12 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("max connections must be positive: %d", cfg.maxConns)
 	case cfg.timeout <= 0:
 		return config{}, fmt.Errorf("timeout must be positive: %s", cfg.timeout)
+	case cfg.bindRetries < 0:
+		return config{}, fmt.Errorf("bind retries cannot be negative: %d", cfg.bindRetries)
+	case cfg.bindTimeout < 0:
+		return config{}, fmt.Errorf("bind timeout cannot be negative: %s", cfg.bindTimeout)
+	case cfg.countersEach < 0:
+		return config{}, fmt.Errorf("counters interval cannot be negative: %s", cfg.countersEach)
 	}
 	return cfg, nil
 }
@@ -212,6 +311,18 @@ func env(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envDuration(name string, fallback time.Duration) (time.Duration, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", name, value, err)
+	}
+	return d, nil
 }
 
 func envInt(name string, fallback int) (int, error) {
@@ -254,7 +365,7 @@ func (b *bridge) serve(ctx context.Context, listener net.Listener) error {
 				b.handle(ctx, conn)
 			}()
 		default:
-			log.Printf("reject RTSP connection from %s: connection limit reached", conn.RemoteAddr())
+			b.refusals.report("connection limit")
 			closeConn(conn)
 		}
 	}
@@ -281,7 +392,16 @@ func (b *bridge) clientConfig() dahua.Config {
 		Timeout:   b.config.timeout,
 		P2PPort:   b.config.p2pPort,
 		MaxRealms: b.config.maxRealms,
-		Error:     func(format string, args ...any) { log.Printf("dahua: "+format, args...) },
+
+		// The budget is held under the tunnel's dial lock, so it is also how
+		// long every other queued stream waits on a device that has stopped
+		// answering. Keep it inside an RTSP client's patience.
+		BindRetries: b.config.bindRetries,
+		BindTimeout: b.config.bindTimeout,
+
+		LossReportInterval: b.config.countersEach,
+
+		Error: func(format string, args ...any) { log.Printf("dahua: "+format, args...) },
 	}
 	if b.config.debug {
 		cfg.Trace = func(format string, args ...any) { log.Printf("dahua: "+format, args...) }
@@ -344,7 +464,7 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 
 	device, finishNegotiation, err := b.openRealm(ctx)
 	if err != nil {
-		log.Printf("open P2P realm from %s: %v", upstream.RemoteAddr(), err)
+		b.refusals.report(refusalReason(err))
 		if b.client.IsClosed() || b.client.IsRetired() {
 			b.cancel()
 		}
@@ -377,12 +497,46 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 	}
 }
 
+// Reasons a stream is turned away, kept as sentinels so the log groups them
+// rather than printing one line per retry.
+var (
+	errAdmitTimeout  = errors.New("waiting for negotiate lock")
+	errRealmCapacity = errors.New("realm capacity reached")
+)
+
+// refusalReason names the failure for the refusal log. RTSP gives the client
+// only a closed connection, so this line is the sole record of why a stream
+// did not start.
+func refusalReason(err error) string {
+	switch {
+	case errors.Is(err, errAdmitTimeout):
+		return "negotiate lock busy"
+	case errors.Is(err, errRealmCapacity):
+		return "realm capacity"
+	case errors.Is(err, dahua.ErrDialTimeout):
+		return "device refusing realms"
+	case errors.Is(err, dahua.ErrTunnelRetired):
+		return "tunnel retired"
+	case errors.Is(err, dahua.ErrTunnelClosed):
+		return "tunnel closed"
+	default:
+		return "error: " + err.Error()
+	}
+}
+
 func (b *bridge) openRealm(ctx context.Context) (net.Conn, func(), error) {
-	negotiateCtx, cancel := context.WithTimeout(ctx, negotiateTimeout)
-	err := b.client.LockNegotiate(negotiateCtx)
+	admitCtx, cancel := context.WithTimeout(ctx, admitTimeout)
+	err := b.client.LockNegotiate(admitCtx)
 	cancel()
 	if err != nil {
-		return nil, nil, fmt.Errorf("negotiate lock: %w", err)
+		return nil, nil, fmt.Errorf("%w: %w", errAdmitTimeout, err)
+	}
+	// Checked before settling: a BIND the device would refuse is not worth
+	// the settle delay, and the caller can be turned away while its client
+	// is still listening.
+	if n := b.client.ActiveRealms(); n >= b.config.maxRealms {
+		b.client.UnlockNegotiate()
+		return nil, nil, fmt.Errorf("%w: %d/%d", errRealmCapacity, n, b.config.maxRealms)
 	}
 	b.client.WaitSettle()
 
@@ -393,11 +547,13 @@ func (b *bridge) openRealm(ctx context.Context) (net.Conn, func(), error) {
 			b.client.UnlockNegotiate()
 		})
 	}
+
 	device, err := b.client.Dial(b.client.RTSPPort())
 	if err != nil {
 		finish()
 		return nil, nil, fmt.Errorf("dial P2P realm: %w", err)
 	}
+	b.served.Store(true)
 	return device, finish, nil
 }
 

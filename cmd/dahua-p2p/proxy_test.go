@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/blackjid/dahua-p2p"
 )
 
 func TestSuperviseRestartsBridgeCycle(t *testing.T) {
@@ -251,20 +254,63 @@ func TestClientConfig(t *testing.T) {
 	}
 }
 
-func TestConnectionLimit(t *testing.T) {
+func TestTallyGroupsRefusalsByReason(t *testing.T) {
+	var tl tally
+
+	// The first refusal reports immediately, so a lone failure is never
+	// silently swallowed.
+	if got := tl.add("realm capacity", time.Minute); got == nil || got["realm capacity"] != 1 {
+		t.Fatalf("first add() = %v, want the realm capacity count", got)
+	}
+
+	// Everything inside the interval accumulates instead of printing.
+	for i := 0; i < 3; i++ {
+		if got := tl.add("negotiate lock busy", time.Minute); got != nil {
+			t.Fatalf("add() reported %v inside the interval, want nil", got)
+		}
+	}
+	if got := tl.add("realm capacity", time.Minute); got != nil {
+		t.Fatalf("add() reported %v inside the interval, want nil", got)
+	}
+
+	// The next report carries every reason seen since the last one, so no
+	// refusal is lost, only delayed.
+	got := tl.add("tunnel retired", 0)
+	want := map[string]int{"negotiate lock busy": 3, "realm capacity": 1, "tunnel retired": 1}
+	if len(got) != len(want) {
+		t.Fatalf("add() = %v, want %v", got, want)
+	}
+	for reason, n := range want {
+		if got[reason] != n {
+			t.Fatalf("add()[%q] = %d, want %d (full: %v)", reason, got[reason], n, got)
+		}
+	}
+
+	// Counts reset after a report rather than accumulating forever.
+	if got := tl.add("realm capacity", 0); len(got) != 1 || got["realm capacity"] != 1 {
+		t.Fatalf("add() after a report = %v, want a fresh count", got)
+	}
+}
+
+func TestRefusalReasonNamesSentinels(t *testing.T) {
 	tests := []struct {
-		name string
-		cfg  config
-		want int
+		err  error
+		want string
 	}{
-		{name: "realm limit", cfg: config{maxConns: 32, maxRealms: 8}, want: 8},
-		{name: "connection limit", cfg: config{maxConns: 4, maxRealms: 8}, want: 4},
+		{fmt.Errorf("%w: %w", errAdmitTimeout, context.DeadlineExceeded), "negotiate lock busy"},
+		{fmt.Errorf("%w: %d/%d", errRealmCapacity, 8, 8), "realm capacity"},
+		{fmt.Errorf("dial P2P realm: %w", dahua.ErrDialTimeout), "device refusing realms"},
+		{fmt.Errorf("dial P2P realm: %w", dahua.ErrTunnelRetired), "tunnel retired"},
+		{fmt.Errorf("dial P2P realm: %w", dahua.ErrTunnelClosed), "tunnel closed"},
 	}
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := connectionLimit(tt.cfg); got != tt.want {
-				t.Fatalf("connectionLimit() = %d, want %d", got, tt.want)
-			}
-		})
+		if got := refusalReason(tt.err); got != tt.want {
+			t.Errorf("refusalReason(%v) = %q, want %q", tt.err, got, tt.want)
+		}
+	}
+
+	// An unclassified failure still has to say what went wrong.
+	if got := refusalReason(errors.New("boom")); !strings.Contains(got, "boom") {
+		t.Errorf("refusalReason of an unknown error = %q, want it to carry the message", got)
 	}
 }
