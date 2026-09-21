@@ -104,6 +104,7 @@ type Tunnel struct {
 	// ACK coalescing: batch multiple received packets into a single ACK.
 	// ackMu also guards consecutiveSendErrs, which only flushACK touches.
 	ackPending          bool
+	ackUnacked          int // inbound packets since the last ACK
 	ackTimer            *time.Timer
 	consecutiveSendErrs int
 	ackMu               sync.Mutex
@@ -720,15 +721,44 @@ func (t *Tunnel) reader() {
 	}
 }
 
-// ackCoalesceWindow is how long to wait before sending a batched ACK.
-// The DMSS app averages ~2.7 payloads per ACK; 20ms coalesces effectively
-// while staying responsive.
-const ackCoalesceWindow = 20 * time.Millisecond
+// ACK coalescing is counted in packets, not time. The device paces itself at
+// roughly 300 packets per second and fills them fuller as the bitrate rises --
+// measured at 290 pkt/s carrying 167 B each across a 16-pane substream grid,
+// and 298 pkt/s carrying 990 B each with one pane at full resolution, a six
+// fold difference in bitrate at the same packet rate. Against both, DMSS
+// returned one ACK per 1.88 inbound packets.
+//
+// A time window cannot track that: 20ms at 290 pkt/s is one ACK per 5.8
+// packets, a third of the app's rate, and the shortfall only bites once the
+// packets are full -- which is exactly the main-stream case. ackCoalesceWindow
+// stays as a backstop so a trailing packet is still acknowledged when the
+// flow stops short of the count.
+const (
+	ackCoalesceCount  = 2
+	ackCoalesceWindow = 20 * time.Millisecond
+)
 
-// scheduleACK marks that an ACK is needed and starts a coalescing timer.
-// Multiple received packets within the window produce a single ACK,
-// reducing traffic to the device.
+// scheduleACK records an inbound packet and acknowledges once enough have
+// arrived, or after ackCoalesceWindow if the flow stops first. Called only
+// from the reader goroutine, so the count needs no ordering beyond its lock.
 func (t *Tunnel) scheduleACK() {
+	t.ackMu.Lock()
+	t.ackUnacked++
+	reached := t.ackUnacked >= ackCoalesceCount
+	if reached {
+		if t.ackTimer != nil {
+			t.ackTimer.Stop()
+			t.ackTimer = nil
+		}
+		t.ackPending = false
+	}
+	t.ackMu.Unlock()
+
+	if reached {
+		t.flushACK()
+		return
+	}
+
 	t.ackMu.Lock()
 	defer t.ackMu.Unlock()
 
@@ -745,6 +775,7 @@ func (t *Tunnel) scheduleACK() {
 // sendPacket, racing on consecutiveSendErrs.
 func (t *Tunnel) flushACK() {
 	t.ackMu.Lock()
+	t.ackUnacked = 0
 	err := t.sendPacket(ptcp.NewEmptyBody())
 	if err == nil {
 		t.consecutiveSendErrs = 0

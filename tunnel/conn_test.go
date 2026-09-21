@@ -7,6 +7,9 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/blackjid/dahua-p2p/dh"
+	"github.com/blackjid/dahua-p2p/ptcp"
 )
 
 func newTestConn() *Conn {
@@ -223,5 +226,47 @@ func TestRemoteAddrUsesDialPort(t *testing.T) {
 	c.remotePort = 8554
 	if got := c.RemoteAddr().(*net.TCPAddr).Port; got != 8554 {
 		t.Fatalf("RemoteAddr port = %d, want 8554", got)
+	}
+}
+
+func TestACKIsCountedInPacketsNotTime(t *testing.T) {
+	tun := &Tunnel{trace: nopLog, errorf: nopLog}
+
+	// One packet is not enough: the flow may continue, so it waits for a
+	// second rather than paying a datagram per inbound packet.
+	tun.scheduleACK()
+	tun.ackMu.Lock()
+	pending, unacked := tun.ackPending, tun.ackUnacked
+	tun.ackMu.Unlock()
+	if !pending || unacked != 1 {
+		t.Fatalf("after 1 packet: pending=%v unacked=%d, want true/1", pending, unacked)
+	}
+	if tun.ackTimer == nil {
+		t.Fatal("no backstop timer armed for a flow that stops at one packet")
+	}
+}
+
+func TestACKCountResetsAfterFlush(t *testing.T) {
+	client, err := dh.NewUDPClient(time.Second)
+	if err != nil {
+		t.Fatalf("NewUDPClient: %v", err)
+	}
+	defer client.Close()
+
+	// Unconnected: the send fails, which is the path that matters. If the
+	// count only reset on a successful send, one failed ACK would leave it
+	// latched and every later packet would ACK immediately, forever.
+	tun := &Tunnel{session: ptcp.NewSession(), client: client, trace: nopLog, errorf: nopLog}
+
+	tun.ackMu.Lock()
+	tun.ackUnacked = 7
+	tun.ackMu.Unlock()
+
+	tun.flushACK()
+
+	tun.ackMu.Lock()
+	defer tun.ackMu.Unlock()
+	if tun.ackUnacked != 0 {
+		t.Fatalf("unacked = %d after a failed flush, want 0", tun.ackUnacked)
 	}
 }
