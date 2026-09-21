@@ -316,11 +316,19 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 
 func (b *bridge) openRealm(ctx context.Context, cfg dahua.Config) (net.Conn, func(), func(), error) {
 	var lastErr error
+	// The client is still waiting on its first RTSP response while all of
+	// this runs, and it applies its own deadline to that response — five
+	// seconds in go2rtc. Acquire, lock, settle and BIND all come out of that
+	// budget before a single byte reaches the device, so each phase is timed
+	// separately: a total past the deadline loses the stream no matter how
+	// quickly the device then answers.
+	realmStart := time.Now()
 	for attempt := 0; attempt < 2; attempt++ {
 		client, err := b.sessions.Acquire(cfg)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("P2P handshake: %w", err)
 		}
+		acquired := time.Now()
 
 		negotiateCtx, cancel := context.WithTimeout(ctx, negotiateTimeout)
 		err = client.LockNegotiate(negotiateCtx)
@@ -329,7 +337,9 @@ func (b *bridge) openRealm(ctx context.Context, cfg dahua.Config) (net.Conn, fun
 			b.sessions.Release(b.config.serial, client)
 			return nil, nil, nil, fmt.Errorf("negotiate lock: %w", err)
 		}
+		locked := time.Now()
 		client.WaitSettle()
+		settled := time.Now()
 
 		var finishOnce sync.Once
 		finish := func() {
@@ -339,6 +349,7 @@ func (b *bridge) openRealm(ctx context.Context, cfg dahua.Config) (net.Conn, fun
 			})
 		}
 		device, err := client.Dial(client.RTSPPort())
+		logRealmOpen(attempt, realmStart, acquired, locked, settled, time.Now(), err)
 		if err == nil {
 			release := func() { b.sessions.Release(b.config.serial, client) }
 			return device, finish, release, nil
@@ -352,6 +363,29 @@ func (b *bridge) openRealm(ctx context.Context, cfg dahua.Config) (net.Conn, fun
 		}
 	}
 	return nil, nil, nil, fmt.Errorf("dial P2P realm: %w", lastErr)
+}
+
+// realmOpenBudget is the deadline an unmodified go2rtc applies to the RTSP
+// response this whole sequence delays (pkg/rtsp.Timeout). Past it the client
+// has already given up, so the realm is opened for nobody.
+const realmOpenBudget = 5 * time.Second
+
+func logRealmOpen(attempt int, start, acquired, locked, settled, done time.Time, err error) {
+	total := done.Sub(start)
+	verdict := ""
+	if total >= realmOpenBudget {
+		verdict = fmt.Sprintf(" (past the %s an RTSP client allows)", realmOpenBudget)
+	}
+	ms := func(a, b time.Time) string { return b.Sub(a).Round(time.Millisecond).String() }
+	if err != nil {
+		log.Printf("realm timing attempt=%d FAILED total=%s%s acquire=%s lock=%s settle=%s bind=%s: %v",
+			attempt+1, total.Round(time.Millisecond), verdict,
+			ms(start, acquired), ms(acquired, locked), ms(locked, settled), ms(settled, done), err)
+		return
+	}
+	log.Printf("realm timing attempt=%d total=%s%s acquire=%s lock=%s settle=%s bind=%s",
+		attempt+1, total.Round(time.Millisecond), verdict,
+		ms(start, acquired), ms(acquired, locked), ms(locked, settled), ms(settled, done))
 }
 
 func closeListener(listener net.Listener) {
