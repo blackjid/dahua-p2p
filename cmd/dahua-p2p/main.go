@@ -24,6 +24,14 @@ const (
 	initialRequestTimeout = 10 * time.Second
 	negotiateTimeout      = 90 * time.Second
 	defaultMaxConnections = 32
+
+	// spareDepth is how many tunnel reservations the bridge keeps in hand.
+	// A reservation on a tunnel that already has room is free; the one that
+	// finds every tunnel full pays the P2P handshake, measured at 3s rested
+	// and 17s on a loaded device. Holding a couple in advance moves that
+	// handshake into the background, off the five seconds an RTSP client
+	// gives its first response.
+	spareDepth = 2
 )
 
 type config struct {
@@ -41,6 +49,7 @@ type config struct {
 type bridge struct {
 	config      config
 	sessions    *dahua.SessionManager
+	spare       chan *dahua.Client
 	slots       chan struct{}
 	connections map[net.Conn]struct{}
 	mu          sync.Mutex
@@ -65,11 +74,12 @@ func run() error {
 	b := &bridge{
 		config:      cfg,
 		sessions:    dahua.NewSessionManager(),
+		spare:       make(chan *dahua.Client, spareDepth),
 		slots:       make(chan struct{}, cfg.maxConns),
 		connections: make(map[net.Conn]struct{}),
 	}
 
-	if err = b.prewarm(); err != nil {
+	if err = b.prewarm(ctx); err != nil {
 		return fmt.Errorf("prewarm P2P tunnel: %w", err)
 	}
 
@@ -205,15 +215,76 @@ func (b *bridge) serve(ctx context.Context, listener net.Listener) error {
 	}
 }
 
-// prewarm establishes one tunnel at startup and intentionally retains its
-// reservation. CloseAll releases it when the bridge shuts down. The extra
-// internal realm keeps maxRealms available for actual RTSP connections.
-func (b *bridge) prewarm() error {
-	if _, err := b.sessions.Acquire(b.clientConfig()); err != nil {
+// prewarm establishes the first tunnel at startup, synchronously, so bad
+// credentials or an unreachable device stop the process here rather than
+// surfacing as a failed stream minutes later. Its reservation becomes the
+// first spare; the warmer keeps the rest topped up.
+func (b *bridge) prewarm(ctx context.Context) error {
+	client, err := b.sessions.Acquire(b.clientConfig())
+	if err != nil {
 		return err
 	}
+	b.spare <- client
+	go b.warmTunnels(ctx)
 	log.Printf("Dahua P2P tunnel ready for serial %s", b.config.serial)
 	return nil
+}
+
+// warmTunnels keeps spareDepth reservations in hand, refilling each one the
+// moment a stream takes it. While a tunnel has room this costs nothing; when
+// it fills, the handshake for the next tunnel happens here, with no RTSP
+// client waiting on it.
+func (b *bridge) warmTunnels(ctx context.Context) {
+	const maxBackoff = 30 * time.Second
+	backoff := time.Second
+	for {
+		client, err := b.sessions.Acquire(b.clientConfig())
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, dahua.ErrSessionManagerClosed) {
+				return
+			}
+			// A full fixed-port tunnel is a standing condition, not a
+			// fault: a second tunnel cannot bind the same local port. Back
+			// off quietly and retry once a stream has left.
+			if !errors.Is(err, dahua.ErrFixedPortCapacity) {
+				log.Printf("warm spare tunnel: %v", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff *= 2; backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		backoff = time.Second
+
+		select {
+		case b.spare <- client:
+		case <-ctx.Done():
+			b.sessions.Release(b.config.serial, client)
+			return
+		}
+	}
+}
+
+// takeSpare returns a reservation held in advance, or nil if none is in hand.
+// A reservation can go stale while it waits: its tunnel can die, or go deaf
+// to BINDs and be retired. Those are dropped rather than handed to a stream.
+func (b *bridge) takeSpare() *dahua.Client {
+	for {
+		select {
+		case client := <-b.spare:
+			if !client.IsClosed() && !client.IsRetired() {
+				return client
+			}
+			b.sessions.Release(b.config.serial, client)
+		default:
+			return nil
+		}
+	}
 }
 
 func (b *bridge) clientConfig() dahua.Config {
@@ -223,7 +294,7 @@ func (b *bridge) clientConfig() dahua.Config {
 		Password:  b.config.password,
 		Timeout:   b.config.timeout,
 		P2PPort:   b.config.p2pPort,
-		MaxRealms: b.config.maxRealms + 1,
+		MaxRealms: b.config.maxRealms,
 		Error:     func(format string, args ...any) { log.Printf("dahua: "+format, args...) },
 	}
 	if b.config.debug {
@@ -324,14 +395,17 @@ func (b *bridge) openRealm(ctx context.Context, cfg dahua.Config) (net.Conn, fun
 	// quickly the device then answers.
 	realmStart := time.Now()
 	for attempt := 0; attempt < 2; attempt++ {
-		client, err := b.sessions.Acquire(cfg)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("P2P handshake: %w", err)
+		client := b.takeSpare()
+		if client == nil {
+			var err error
+			if client, err = b.sessions.Acquire(cfg); err != nil {
+				return nil, nil, nil, fmt.Errorf("P2P handshake: %w", err)
+			}
 		}
 		acquired := time.Now()
 
 		negotiateCtx, cancel := context.WithTimeout(ctx, negotiateTimeout)
-		err = client.LockNegotiate(negotiateCtx)
+		err := client.LockNegotiate(negotiateCtx)
 		cancel()
 		if err != nil {
 			b.sessions.Release(b.config.serial, client)
