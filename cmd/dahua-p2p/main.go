@@ -35,13 +35,6 @@ const (
 	// bridge that can actually answer it.
 	admitTimeout = 3 * time.Second
 
-	// maxSettleWait is how much of the client's remaining patience may be
-	// spent waiting for the device to be ready for another realm. Waiting
-	// happens under the negotiate lock, so anything longer starves every
-	// other stream as well; past it we turn this one away at once and let it
-	// retry, which costs it a reconnect instead of costing all of them.
-	maxSettleWait = time.Second
-
 	// logInterval is the minimum gap between repeats of a throttled line.
 	logInterval = 5 * time.Second
 
@@ -81,10 +74,14 @@ type bridge struct {
 	cancel      context.CancelFunc
 	slots       chan struct{}
 	connections map[net.Conn]struct{}
-	served      atomic.Bool
-	refusals    tally
-	mu          sync.Mutex
-	wg          sync.WaitGroup
+	// dialing counts realms being negotiated but not yet granted. Several
+	// negotiations run at once, so without it each would see the same free
+	// slot and they would overshoot maxRealms together.
+	dialing  atomic.Int64
+	served   atomic.Bool
+	refusals tally
+	mu       sync.Mutex
+	wg       sync.WaitGroup
 }
 
 // tally counts refusals by reason and reports them as one line per
@@ -550,9 +547,8 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 var errLostContact = errors.New("device unreachable")
 
 var (
-	errAdmitTimeout   = errors.New("waiting for negotiate lock")
-	errRealmCapacity  = errors.New("realm capacity reached")
-	errDeviceSettling = errors.New("device not ready for another realm")
+	errAdmitTimeout  = errors.New("waiting for negotiate lock")
+	errRealmCapacity = errors.New("realm capacity reached")
 )
 
 // refusalReason names the failure for the refusal log. RTSP gives the client
@@ -564,8 +560,6 @@ func refusalReason(err error) string {
 		return "negotiate lock busy"
 	case errors.Is(err, errRealmCapacity):
 		return "realm capacity"
-	case errors.Is(err, errDeviceSettling):
-		return "device settling"
 	case errors.Is(err, dahua.ErrDialTimeout):
 		return "device refusing realms"
 	case errors.Is(err, dahua.ErrTunnelRetired):
@@ -577,6 +571,24 @@ func refusalReason(err error) string {
 	}
 }
 
+// claimRealmSlot reserves capacity for one realm about to be negotiated and
+// reports the resulting realm count. Negotiations run concurrently, so the
+// count has to include those still waiting on a BIND; going by ActiveRealms
+// alone lets every one of them see the same free slot and overshoot maxRealms
+// together. A claim that does not fit is given back, and the caller releases a
+// successful one with releaseRealmSlot once the realm is either granted — and
+// so counted by ActiveRealms — or refused.
+func (b *bridge) claimRealmSlot(active int) (int, bool) {
+	n := active + int(b.dialing.Add(1)) - 1
+	if n >= b.config.maxRealms {
+		b.dialing.Add(-1)
+		return n, false
+	}
+	return n, true
+}
+
+func (b *bridge) releaseRealmSlot() { b.dialing.Add(-1) }
+
 func (b *bridge) openRealm(ctx context.Context) (net.Conn, func(), error) {
 	admitCtx, cancel := context.WithTimeout(ctx, admitTimeout)
 	err := b.client.LockNegotiate(admitCtx)
@@ -584,33 +596,21 @@ func (b *bridge) openRealm(ctx context.Context) (net.Conn, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", errAdmitTimeout, err)
 	}
-	// Checked before settling: a BIND the device would refuse is not worth
-	// the settle delay, and the caller can be turned away while its client
-	// is still listening.
-	if n := b.client.ActiveRealms(); n >= b.config.maxRealms {
+	// Checked while the caller's client is still listening, so a stream that
+	// cannot get a realm is refused rather than left hanging.
+	n, ok := b.claimRealmSlot(b.client.ActiveRealms())
+	if !ok {
 		b.client.UnlockNegotiate()
 		return nil, nil, fmt.Errorf("%w: %d/%d", errRealmCapacity, n, b.config.maxRealms)
 	}
 
-	// The device goes quiet for seconds after granting a realm. Waiting that
-	// out holds the negotiate lock, so wait only what this client can afford
-	// and stand down beyond it rather than taking every other stream down
-	// with us.
-	if wait := b.client.SettleRemaining(); wait > maxSettleWait {
-		b.client.UnlockNegotiate()
-		return nil, nil, fmt.Errorf("%w: ready in %s", errDeviceSettling, wait.Round(time.Millisecond))
-	}
-	b.client.WaitSettle()
-
 	var finishOnce sync.Once
 	finish := func() {
-		finishOnce.Do(func() {
-			b.client.DoneNegotiate()
-			b.client.UnlockNegotiate()
-		})
+		finishOnce.Do(b.client.UnlockNegotiate)
 	}
 
 	device, err := b.client.Dial(b.client.RTSPPort())
+	b.releaseRealmSlot()
 	if err != nil {
 		finish()
 		return nil, nil, fmt.Errorf("dial P2P realm: %w", err)

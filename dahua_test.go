@@ -1,6 +1,7 @@
 package dahua
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -67,59 +68,34 @@ func TestSessionKeyIncludesTunnelConfiguration(t *testing.T) {
 	}
 }
 
-// The device goes silent for seconds after granting a realm. Each unanswered
-// BIND has to widen the gap before the next one: asking sooner does not get a
-// realm, it just spends another dial budget under the negotiate lock and
-// takes every queued stream down with it.
-func TestSettleBacksOffWhileTheDeviceIgnoresBinds(t *testing.T) {
-	// A healthy tunnel keeps the short gap, so a cold start still brings
-	// eight streams up in about a second.
-	if got := settleFor(0, true); got != minNegotiateSettle {
-		t.Fatalf("settleFor(0, responsive) = %s, want %s", got, minNegotiateSettle)
-	}
-	if got := settleFor(0, false); got != NegotiateSettle {
-		t.Fatalf("settleFor(0, quiet) = %s, want %s", got, NegotiateSettle)
+// A DMSS capture shows the device answering three or four overlapping BINDs
+// in 10-30ms each while opening seventeen realms, so realm setup is not paced
+// and several negotiations may be in flight at once. The bound exists only so
+// a stream that cannot be served is refused while its client is still there.
+func TestNegotiationsRunConcurrentlyButBounded(t *testing.T) {
+	if MaxConcurrentNegotiations < 2 {
+		t.Fatalf("MaxConcurrentNegotiations = %d, want realm setup to overlap",
+			MaxConcurrentNegotiations)
 	}
 
-	last := time.Duration(0)
-	for failures := 1; failures <= 6; failures++ {
-		got := settleFor(failures, true)
-		if got <= last && got != maxNegotiateSettle {
-			t.Fatalf("settleFor(%d) = %s, want more than %s", failures, got, last)
+	c := &Client{negotiateSem: make(chan struct{}, MaxConcurrentNegotiations)}
+	ctx := context.Background()
+	for i := 0; i < MaxConcurrentNegotiations; i++ {
+		if err := c.LockNegotiate(ctx); err != nil {
+			t.Fatalf("LockNegotiate %d of %d: %v", i+1, MaxConcurrentNegotiations, err)
 		}
-		if got > maxNegotiateSettle {
-			t.Fatalf("settleFor(%d) = %s, want at most the %s cap", failures, got, maxNegotiateSettle)
-		}
-		last = got
 	}
 
-	// Ignored BINDs outrank responsiveness: the device answers heartbeats
-	// perfectly well while refusing every realm, which is the whole reason
-	// liveness cannot be used to pace this.
-	if got := settleFor(3, true); got <= NegotiateSettle {
-		t.Fatalf("settleFor(3, responsive) = %s, want more than %s", got, NegotiateSettle)
+	// Past the bound a caller waits rather than piling on, and gives up with
+	// its context rather than wedging.
+	full, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if err := c.LockNegotiate(full); err == nil {
+		t.Fatal("LockNegotiate past the bound returned nil, want the context error")
 	}
 
-	// Stays capped rather than overflowing into a negative or absurd wait.
-	for _, failures := range []int{20, 64, 1000} {
-		if got := settleFor(failures, true); got != maxNegotiateSettle {
-			t.Fatalf("settleFor(%d) = %s, want the %s cap", failures, got, maxNegotiateSettle)
-		}
-	}
-}
-
-func TestRetireOnlyAfterTheSettleHasBeenCappedForAWhile(t *testing.T) {
-	// Retiring rebuilds the tunnel, which costs a cloud handshake and strands
-	// the session on the device. A handful of ignored BINDs is normal, so the
-	// threshold has to sit well past the point the settle reaches its cap.
-	capped := 0
-	for failures := 1; failures <= maxBindFailures; failures++ {
-		if settleFor(failures, true) == maxNegotiateSettle {
-			capped++
-		}
-	}
-	if capped < 3 {
-		t.Fatalf("settle is capped for only %d of %d attempts before retiring; "+
-			"the tunnel gives up before waiting is given a fair chance", capped, maxBindFailures)
+	c.UnlockNegotiate()
+	if err := c.LockNegotiate(ctx); err != nil {
+		t.Fatalf("LockNegotiate after a release: %v", err)
 	}
 }

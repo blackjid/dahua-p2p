@@ -47,9 +47,10 @@ type Tunnel struct {
 	done    chan struct{} // closed on shutdown; used by reader and heartbeat
 
 	// sendPermit serializes outbound packets so that session.Send (which
-	// assigns LMID/PID) and client.Send (UDP write) happen atomically. A
-	// channel is used instead of a mutex so a queued Conn.Write can be
-	// interrupted by its deadline or Close.
+	// reads the byte counters into the header) and client.Send (UDP write)
+	// happen atomically, keeping the Sent/Recv a packet advertises true of
+	// the moment it leaves. A channel is used instead of a mutex so a queued
+	// Conn.Write can be interrupted by its deadline or Close.
 	sendOnce   sync.Once
 	sendPermit chan struct{}
 	// writeDeadlineMu lets SetWriteDeadline update the socket when this realm
@@ -65,17 +66,16 @@ type Tunnel struct {
 	// For connection establishment
 	connCh   map[uint32]chan bool
 	connChMu sync.Mutex
-	dialMu   sync.Mutex // serializes Dial calls so BINDs don't overlap
 
 	// bindFailures counts consecutive Dial calls that exhausted their BIND
-	// retries. Guarded by dialMu, which serializes every Dial. A device can
-	// keep answering heartbeats while refusing to grant any new realm, so
-	// liveness alone is not proof the tunnel is still usable.
-	bindFailures int
+	// retries. A device can keep answering heartbeats while refusing to grant
+	// any new realm, so liveness alone is not proof the tunnel is still
+	// usable.
+	bindFailures   int
+	bindFailuresMu sync.Mutex
 
-	// How long one Dial may spend on a realm, fixed at construction. Held
-	// under dialMu for the whole attempt, so it is also the worst case every
-	// other queued stream waits.
+	// How long one Dial may spend on a realm, fixed at construction. Dials
+	// run concurrently, so this bounds only the caller that owns it.
 	bindRetries int
 	bindTimeout time.Duration
 
@@ -105,12 +105,15 @@ type Tunnel struct {
 	lastDrain     uint32
 	lastDrainTime time.Time
 
-	// ACK coalescing: batch multiple received packets into a single ACK.
-	// ackMu also guards consecutiveSendErrs, which only flushACK touches.
+	// ACK coalescing: batch the packets that arrive inside one short window
+	// into a single ACK. ackMu guards this state and is never held across a
+	// send, because the reader takes it for every inbound packet. ackFlushMu
+	// is what keeps two flushes from overlapping.
 	ackPending          bool
 	ackTimer            *time.Timer
 	consecutiveSendErrs int
 	ackMu               sync.Mutex
+	ackFlushMu          sync.Mutex
 
 	trace  func(format string, v ...any)
 	errorf func(format string, v ...any)
@@ -211,9 +214,11 @@ func New(cfg Config) (*Tunnel, error) {
 	return t, nil
 }
 
-// A BIND on a healthy tunnel is answered well inside a second, so the budget
-// exists only to ride out UDP loss. Two attempts of two seconds stay under
-// the five seconds RTSP clients typically allow a single command.
+// A BIND on a healthy tunnel is answered in 10-30ms — a DMSS capture shows
+// seventeen realms opened that way, three or four BINDs in flight at once,
+// every one granted — so the budget exists only to ride out UDP loss. Two
+// attempts of two seconds stay under the five seconds RTSP clients typically
+// allow a single command.
 const (
 	defaultBindRetries = 2
 	defaultBindTimeout = 2 * time.Second
@@ -251,15 +256,15 @@ func (t *Tunnel) reportLoss() {
 				continue
 			}
 			st := t.session.Stats()
-			t.trace("ptcp counters sent=%d peer_recv=%d out_unacked=%d out_msgs=%d recv=%d peer_sent=%d in_skew=%d realms=%d",
-				st.Sent, st.PeerRecv, st.OutBytes(), st.OutMsgs(),
+			t.trace("ptcp counters sent=%d peer_recv=%d out_unacked=%d out_lag_ms=%d recv=%d peer_sent=%d in_skew=%d realms=%d",
+				st.Sent, st.PeerRecv, st.OutBytes(), st.OutLagMillis(),
 				st.Recv, st.PeerSent, st.InBytes(), t.ActiveRealms())
 		}
 	}
 }
 
-// sendPacket serializes session-state update and UDP write under sendMu so
-// packets always arrive at the device in the order their LMID/PID were assigned.
+// sendPacket serializes the session-state update and the UDP write so the
+// counters a packet advertises match what has actually gone out.
 func (t *Tunnel) sendPacket(body *ptcp.Body) error {
 	return t.sendPacketFor(body, nil)
 }
@@ -579,9 +584,9 @@ func (t *Tunnel) sendHeartbeat() {
 		// directions failing together points at the UDP path; only outbound
 		// failing points at the device's receive side.
 		t.errorf("device stopped consuming our data (unacked=%d for >%s), closing tunnel: "+
-			"sent=%d peer_recv=%d out_msgs=%d recv=%d peer_sent=%d in_skew=%d realms=%d",
+			"sent=%d peer_recv=%d out_lag_ms=%d recv=%d peer_sent=%d in_skew=%d realms=%d",
 			st.OutBytes(), outboundStallTimeout,
-			st.Sent, st.PeerRecv, st.OutMsgs(), st.Recv, st.PeerSent, st.InBytes(), t.ActiveRealms())
+			st.Sent, st.PeerRecv, st.OutLagMillis(), st.Recv, st.PeerSent, st.InBytes(), t.ActiveRealms())
 		t.LoseContact()
 	}
 }
@@ -728,13 +733,19 @@ func (t *Tunnel) reader() {
 }
 
 // ackCoalesceWindow is how long to wait before sending a batched ACK.
-// The DMSS app averages ~2.7 payloads per ACK; 20ms coalesces effectively
-// while staying responsive.
-const ackCoalesceWindow = 20 * time.Millisecond
+// Measured against a DMSS capture the app answers inbound data after 0.88ms
+// at the median and 5ms at p90, batching 2.55 packets per ACK. A millisecond
+// reproduces that: inbound packets arrive 0.44ms apart at the median, so a
+// window this short still coalesces a couple of them while leaving the
+// device's view of what we have consumed essentially current.
+//
+// The previous 20ms capped ACKs at 50/s regardless of load, which at the
+// observed 226 packets/s left ~5.8KB unacknowledged on every cycle.
+const ackCoalesceWindow = time.Millisecond
 
 // scheduleACK marks that an ACK is needed and starts a coalescing timer.
-// Multiple received packets within the window produce a single ACK,
-// reducing traffic to the device.
+// Called by the reader for every inbound packet, so it must never block on
+// anything slower than ackMu.
 func (t *Tunnel) scheduleACK() {
 	t.ackMu.Lock()
 	defer t.ackMu.Unlock()
@@ -746,20 +757,28 @@ func (t *Tunnel) scheduleACK() {
 	t.ackTimer = time.AfterFunc(ackCoalesceWindow, t.flushACK)
 }
 
-// flushACK sends the coalesced ACK. The whole body runs under ackMu so two
-// flushes can never overlap: clearing ackPending before the send would let
-// the reader arm a second timer that fires while this one is still in
-// sendPacket, racing on consecutiveSendErrs.
+// flushACK sends the coalesced ACK. ackFlushMu keeps two flushes from
+// overlapping; ackMu is dropped before the send so the reader, which takes it
+// for every inbound packet, is never parked behind a UDP write. Clearing
+// ackPending first is deliberate: packets arriving during the send are not
+// covered by it and must arm the next window.
 func (t *Tunnel) flushACK() {
+	t.ackFlushMu.Lock()
+	defer t.ackFlushMu.Unlock()
+
 	t.ackMu.Lock()
+	t.ackPending = false
+	t.ackMu.Unlock()
+
 	err := t.sendPacket(ptcp.NewEmptyBody())
+
+	t.ackMu.Lock()
 	if err == nil {
 		t.consecutiveSendErrs = 0
 	} else {
 		t.consecutiveSendErrs++
 	}
 	errs := t.consecutiveSendErrs
-	t.ackPending = false
 	t.ackMu.Unlock()
 
 	if err == nil {
@@ -805,8 +824,8 @@ func (t *Tunnel) acceptConnect(realm uint32) bool {
 // BindFailures returns how many consecutive Dial calls have exhausted their
 // BIND retries. Reset to zero by any successful Dial.
 func (t *Tunnel) BindFailures() int {
-	t.dialMu.Lock()
-	defer t.dialMu.Unlock()
+	t.bindFailuresMu.Lock()
+	defer t.bindFailuresMu.Unlock()
 	return t.bindFailures
 }
 
@@ -819,27 +838,13 @@ func (t *Tunnel) ActiveRealms() int {
 }
 
 // Dial creates a new realm/connection to the specified port on the device.
-// Serialized via dialMu so the device processes one BIND at a time.
-// Retries the bind request up to 3 times since UDP packets can be lost.
+// Concurrent Dials are expected: the device answers overlapping BINDs, each
+// against its own realm ID, and serializing them only meant one slow dial
+// held every other stream behind it for its whole budget.
+// Retries the bind request since UDP packets can be lost.
 func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 	t.mu.RLock()
 	closed, retired := t.closed, t.retired
-	t.mu.RUnlock()
-	if closed {
-		return nil, ErrTunnelClosed
-	}
-	if retired {
-		return nil, ErrTunnelRetired
-	}
-
-	// Serialize Dial calls: the device can't reliably handle concurrent BINDs
-	t.dialMu.Lock()
-	defer t.dialMu.Unlock()
-
-	// Re-check after the wait: the tunnel may have been retired or closed
-	// while we were queued behind another dial.
-	t.mu.RLock()
-	closed, retired = t.closed, t.retired
 	t.mu.RUnlock()
 	if closed {
 		return nil, ErrTunnelClosed
@@ -902,7 +907,9 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 
 		select {
 		case <-connCh:
+			t.bindFailuresMu.Lock()
 			t.bindFailures = 0
+			t.bindFailuresMu.Unlock()
 			return conn, nil
 		case <-t.done:
 			cleanup()
@@ -914,9 +921,12 @@ func (t *Tunnel) Dial(port uint32) (*Conn, error) {
 		}
 	}
 
+	t.bindFailuresMu.Lock()
 	t.bindFailures++
+	failures := t.bindFailures
+	t.bindFailuresMu.Unlock()
 	t.errorf("bind request timed out after all retries port=%d failures=%d closed=%v",
-		port, t.bindFailures, t.IsClosed())
+		port, failures, t.IsClosed())
 	return nil, ErrDialTimeout
 }
 

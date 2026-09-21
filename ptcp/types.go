@@ -203,9 +203,12 @@ func (b *Body) Serialize() []byte {
 		buf[16], buf[17], buf[18], buf[19] = 0x7f, 0x00, 0x00, 0x01
 		return buf
 	case BodyTypeStatus:
+		// The length field stays zero even though CONN/DISC follows: both the
+		// device and the DMSS app send 12 000000 <realm> <pad> "CONN", so the
+		// four bytes are found by position, not by the length. The body still
+		// counts as 16 towards the byte counters.
 		buf := make([]byte, 12+len(b.Status))
-		dataLen := uint32(len(b.Status))
-		binary.BigEndian.PutUint32(buf[0:4], uint32(TypeStatus)<<24|dataLen)
+		binary.BigEndian.PutUint32(buf[0:4], uint32(TypeStatus)<<24)
 		binary.BigEndian.PutUint32(buf[4:8], b.Realm)
 		copy(buf[12:], b.Status)
 		return buf

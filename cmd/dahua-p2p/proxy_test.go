@@ -356,3 +356,40 @@ func TestLostContactFloorExceedsTheOrdinaryDelay(t *testing.T) {
 			lostContactDelay, reconnectMinDelay)
 	}
 }
+
+// Realm setup runs several negotiations at once, so capacity has to account
+// for the BINDs still in flight. Going by granted realms alone would let every
+// concurrent admission see the same free slot.
+func TestRealmSlotsAccountForBindsInFlight(t *testing.T) {
+	b := &bridge{config: config{maxRealms: 3}}
+
+	// Three claims against an empty tunnel fit; the fourth does not, even
+	// though not one realm has been granted yet.
+	for i := 0; i < 3; i++ {
+		if _, ok := b.claimRealmSlot(0); !ok {
+			t.Fatalf("claim %d of 3 refused on an empty tunnel", i+1)
+		}
+	}
+	if n, ok := b.claimRealmSlot(0); ok {
+		t.Fatalf("claim 4 of 3 admitted at count %d, want a refusal", n)
+	}
+
+	// A refused claim is given back rather than leaking capacity.
+	b.releaseRealmSlot()
+	if _, ok := b.claimRealmSlot(0); !ok {
+		t.Fatal("claim refused after a slot was released")
+	}
+
+	// Granted realms count too: two in flight against one already granted
+	// fills the tunnel.
+	b = &bridge{config: config{maxRealms: 3}}
+	if _, ok := b.claimRealmSlot(1); !ok {
+		t.Fatal("first claim against one granted realm refused")
+	}
+	if _, ok := b.claimRealmSlot(1); !ok {
+		t.Fatal("second claim against one granted realm refused")
+	}
+	if n, ok := b.claimRealmSlot(1); ok {
+		t.Fatalf("third claim against one granted realm admitted at count %d", n)
+	}
+}

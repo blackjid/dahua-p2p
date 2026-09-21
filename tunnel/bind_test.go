@@ -21,26 +21,26 @@ func TestBindFailuresResetBySuccess(t *testing.T) {
 	tn := &Tunnel{}
 
 	// Two exhausted dials put the tunnel over the rebuild threshold.
-	tn.dialMu.Lock()
+	tn.bindFailuresMu.Lock()
 	tn.bindFailures = 2
-	tn.dialMu.Unlock()
+	tn.bindFailuresMu.Unlock()
 
 	if got := tn.BindFailures(); got != 2 {
 		t.Fatalf("BindFailures = %d, want 2", got)
 	}
 
 	// A granted realm means the device is serving BINDs again.
-	tn.dialMu.Lock()
+	tn.bindFailuresMu.Lock()
 	tn.bindFailures = 0
-	tn.dialMu.Unlock()
+	tn.bindFailuresMu.Unlock()
 
 	if got := tn.BindFailures(); got != 0 {
 		t.Fatalf("BindFailures after a successful dial = %d, want 0", got)
 	}
 }
 
-// BindFailures takes dialMu, the same lock Dial holds for its whole run, so a
-// caller reading it from another goroutine must not race or deadlock.
+// Dials run concurrently and each may touch the counter, so a caller reading
+// it from another goroutine must not race or deadlock.
 func TestBindFailuresConcurrentReads(t *testing.T) {
 	tn := &Tunnel{}
 	var wg sync.WaitGroup
