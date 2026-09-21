@@ -477,9 +477,17 @@ func (b *bridge) handle(ctx context.Context, upstream net.Conn) {
 		}
 	}
 
-	if err := proxyRTSP(upstream, upstreamReader, device, firstRequest.Bytes(), requestLine, finishProxyNegotiation); err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Printf("RTSP bridge from %s closed: %v", upstream.RemoteAddr(), err)
+	// Every stream is logged when it ends, not only the ones that end badly.
+	// A clean end and an abandoned one look the same from here, and how long
+	// streams last is the measure of whether a tunnel is holding up.
+	streamStart := time.Now()
+	err = proxyRTSP(upstream, upstreamReader, device, firstRequest.Bytes(), requestLine, finishProxyNegotiation)
+	lasted := time.Since(streamStart).Round(time.Millisecond)
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Printf("RTSP bridge from %s closed after %s: %v", upstream.RemoteAddr(), lasted, err)
+		return
 	}
+	log.Printf("RTSP bridge from %s closed after %s", upstream.RemoteAddr(), lasted)
 }
 
 func (b *bridge) openRealm(ctx context.Context, cfg dahua.Config) (net.Conn, func(), func(), error) {
